@@ -410,16 +410,16 @@ class P115:
     @staticmethod
     def qr_start():
         from p115client import P115Client
-        response=P115Client.login_qrcode_token("alipaymini")
+        response=P115Client.login_qrcode_token("alipaymini",timeout=20)
         data=response.get("data") if isinstance(response,dict) else None
         if not isinstance(data,dict) or not data.get("uid"): raise RuntimeError((response or {}).get("message") or "生成115二维码失败")
-        image=P115Client.login_qrcode(str(data["uid"]),app="alipaymini")
+        image=P115Client.login_qrcode(str(data["uid"]),app="alipaymini",timeout=20)
         return {"uid":str(data["uid"]),"time":data.get("time"),"sign":data.get("sign")}, bytes(image)
 
     @staticmethod
     def qr_poll(token):
         from p115client import P115Client
-        response=P115Client.login_qrcode_scan_status(token)
+        response=P115Client.login_qrcode_scan_status(token,timeout=35)
         data=response.get("data") if isinstance(response,dict) else None
         if not isinstance(data,dict):
             raise RuntimeError((response or {}).get("message") or (response or {}).get("error") or "查询扫码状态失败")
@@ -427,7 +427,7 @@ class P115:
         if status == 0: return "waiting", ""
         if status == 1: return "scanned", ""
         if status != 2: return "expired", ""
-        result=P115Client.login_qrcode_scan_result(str(token["uid"]),app="alipaymini")
+        result=P115Client.login_qrcode_scan_result(str(token["uid"]),app="alipaymini",timeout=20)
         result_data=result.get("data") if isinstance(result,dict) else None
         cookie=(result_data or {}).get("cookie") if isinstance(result_data,dict) else None
         if isinstance(cookie,dict): cookie="; ".join(f"{key}={value}" for key,value in cookie.items() if value is not None)
