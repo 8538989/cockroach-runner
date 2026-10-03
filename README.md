@@ -34,7 +34,7 @@ docker compose up -d --build
 docker compose ps
 ```
 
-打开 `http://服务器IP:8790/admin`，输入管理密钥，依次配置：
+默认只监听服务器本机的 `127.0.0.1:8790`。通过反向代理打开 `https://你的域名/admin`，输入管理密钥，依次配置：
 
 1. Telegram Bot Token 和小程序 HTTPS 公网地址。
 2. 用于监听资源的源 115 Cookie。
@@ -55,6 +55,8 @@ docker compose ps
 ## 数据、备份与迁移
 
 SQLite 数据库保存在 Docker 命名卷 `cockroach-data` 的 `/data/cockroach-runner.db`。Cookie 与 Bot Token 使用 `COCKROACH_ENCRYPTION_KEY` 加密。备份时必须同时保存数据库和 `.env` 中的加密密钥；密钥丢失后，已有 Cookie 和 Token 无法解密。
+
+若要直接复用旧数据目录，可在 `.env` 设置 `COCKROACH_DATA_DIR=/var/lib/cockroach-runner`，并把 `COCKROACH_UID`、`COCKROACH_GID` 设置为该目录所有者的数字 UID/GID。这样无需复制数据库，也方便快速回滚。
 
 从旧的独立 systemd 服务迁移时，在旧服务项目目录执行：
 

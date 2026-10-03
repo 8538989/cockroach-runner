@@ -7,10 +7,11 @@ services:
     environment:
       COCKROACH_ADMIN_KEY: ${COCKROACH_ADMIN_KEY:?请在 .env 中设置管理密钥}
       COCKROACH_ENCRYPTION_KEY: ${COCKROACH_ENCRYPTION_KEY:?请在 .env 中设置 Fernet 密钥}
+    user: "${COCKROACH_UID:-10001}:${COCKROACH_GID:-10001}"
     ports:
-      - "${COCKROACH_PORT:-8790}:8790"
+      - "${COCKROACH_BIND_IP:-127.0.0.1}:${COCKROACH_PORT:-8790}:8790"
     volumes:
-      - cockroach-data:/data
+      - "${COCKROACH_DATA_DIR:-cockroach-data}:/data"
     security_opt:
       - no-new-privileges:true
 
