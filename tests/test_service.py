@@ -56,6 +56,62 @@ class ScanTests(unittest.TestCase):
                 service.P115.find_file, service.P115.transfer = original_find, original_transfer
                 store.db.close()
 
+    def test_distributed_transfer_falls_back_to_source_when_relay_file_is_missing(self):
+        with tempfile.TemporaryDirectory() as data_dir:
+            store = service.Store(data_dir, Fernet.generate_key().decode())
+            store.set("source_cookie", "MAIN-CK", True)
+            store.upsert_user(1, "relay_user", "")
+            store.save_user(1, {"cookie": "RELAY-CK", "uid": "relay"})
+            store.upsert_user(2, "target_user", "")
+            store.save_user(2, {"cookie": "TARGET-CK", "uid": "target", "target_cid": "99"})
+            stamp = service.now()
+            with store.db:
+                store.db.execute("INSERT INTO resources(id,node_id,name,pickcode,sha1,size,first_seen,source_id) VALUES('r','10','Fallback.mkv','pc','ABC',100,?,'legacy')", (stamp,))
+                store.db.execute("INSERT INTO deliveries(id,resource_id,tg_id,status,created,updated) VALUES('done','r',1,'delivered',?,?)", (stamp, stamp))
+            app = service.Application(store)
+            item = {"id": "target", "resource_id": "r", "tg_id": 2, "source_id": "legacy", "target_cid": "99",
+                    "name": "Fallback.mkv", "node_id": "10", "pickcode": "pc", "sha1": "ABC", "size": 100,
+                    "is_dir": 0, "user_name": "", "username": "target_user", "note": ""}
+            calls = []
+            timeouts = []
+            original_find, original_transfer, original_monotonic = service.P115.find_file, service.P115.transfer, service.time.monotonic
+            try:
+                service.P115.find_file = staticmethod(lambda cookie, entry: None)
+                service.P115.transfer = staticmethod(lambda source, target, entry, cid: calls.append((source, target, entry["pickcode"], cid)))
+                moments = iter((100, 110, 125))
+                service.time.monotonic = lambda: next(moments)
+                app.timed_call = lambda callback, timeout: timeouts.append(timeout) or callback()
+                cfg = store.config(True); cfg.update({"distributed_transfer_enabled": True, "transfer_timeout_seconds": 30})
+                self.assertEqual(app.transfer_delivery(cfg, item, "TARGET-CK"), "主源回退")
+                self.assertEqual(calls, [("MAIN-CK", "TARGET-CK", "pc", "99")])
+                self.assertEqual(timeouts, [20, 5])
+            finally:
+                service.P115.find_file, service.P115.transfer, service.time.monotonic = original_find, original_transfer, original_monotonic
+                store.db.close()
+
+    def test_successful_recipient_wakes_retry_and_failed_peers_for_relay(self):
+        with tempfile.TemporaryDirectory() as data_dir:
+            store = service.Store(data_dir, Fernet.generate_key().decode())
+            stamp = service.now()
+            with store.db:
+                store.db.execute("INSERT INTO resources(id,node_id,name,first_seen) VALUES('r','1','Wake.mkv',?)", (stamp,))
+                for tg_id in range(1, 5):
+                    store.db.execute("INSERT INTO users(tg_id,created,updated) VALUES(?,?,?)", (tg_id, stamp, stamp))
+                rows = (("done", 1, "delivered", 1), ("retry", 2, "retry", 2),
+                        ("failed", 3, "failed", 5), ("cancelled", 4, "cancelled", 1))
+                for delivery_id, tg_id, status, attempts in rows:
+                    store.db.execute("INSERT INTO deliveries(id,resource_id,tg_id,status,attempts,next_attempt,created,updated) VALUES(?,?,?, ?,?,?,?,?)",
+                                     (delivery_id, "r", tg_id, status, attempts, stamp + 3600, stamp, stamp))
+            self.assertEqual(store.wake_relay_retries("r", "done"), 2)
+            retry = store.db.execute("SELECT status,attempts,next_attempt,error FROM deliveries WHERE id='retry'").fetchone()
+            failed = store.db.execute("SELECT status,attempts,next_attempt,error FROM deliveries WHERE id='failed'").fetchone()
+            cancelled = store.db.execute("SELECT status FROM deliveries WHERE id='cancelled'").fetchone()
+            self.assertEqual((retry["status"], retry["attempts"], retry["next_attempt"]), ("retry", 2, 0))
+            self.assertEqual((failed["status"], failed["attempts"], failed["next_attempt"]), ("retry", 0, 0))
+            self.assertIn("立即尝试接力秒传", failed["error"])
+            self.assertEqual(cancelled["status"], "cancelled")
+            store.db.close()
+
     def test_transfer_error_hides_115_user_key(self):
         error = RuntimeError({"pid": "1", "filename": "A.mkv", "filesha1": "ABC", "user_id": 9, "user_key": "SECRET"})
         text = service.Application.transfer_error(error)

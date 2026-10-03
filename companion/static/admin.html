@@ -96,6 +96,7 @@
           <label class="field"><span>单个秒传总超时（秒）</span><input id="transferTimeout" type="number" min="30" max="3600" step="1"><small>默认 300 秒；超时后暂停该任务并按退避时间重试。</small></label>
         </div>
         <div class="checks"><label class="check"><input id="enabled" type="checkbox"> 启用自动扫描与派送</label><label class="check"><input id="distributedTransfer" type="checkbox"> 启用成功账号接力秒传（实验）</label><label class="check"><input id="miniEnabled" type="checkbox"> 启用 Telegram 小程序</label></div>
+        <p class="setting-note">开启接力后，同一文件任一用户接收成功都会立即唤醒此前出错或暂停的任务；接力账号中的文件都已移动、删除或不可用时，自动回退源账号。候选查找、接力秒传和源账号兜底共用上方“单个秒传总超时”。</p>
         <div class="actions"><button id="save" class="primary">保存设置</button><button id="testBot">测试 Bot</button><button id="testCd2">测试 CD2</button><button id="scan">立即扫描</button></div>
       </section>
 

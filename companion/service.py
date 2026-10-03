@@ -396,6 +396,16 @@ class Store:
             result.append(item)
         return result
 
+    def wake_relay_retries(self,resource_id,successful_delivery_id):
+        stamp=now()
+        with self.lock,self.db:
+            changed=self.db.execute("""UPDATE deliveries SET status='retry',next_attempt=0,updated=?,
+              attempts=CASE WHEN status='failed' THEN 0 ELSE attempts END,
+              error=CASE WHEN error='' THEN '已有其他账号接收成功，立即尝试接力秒传'
+                ELSE error||'；已有其他账号接收成功，立即尝试接力秒传' END
+              WHERE resource_id=? AND id<>? AND status IN ('retry','failed')""",(stamp,resource_id,successful_delivery_id)).rowcount
+        return changed
+
     def resource_action(self, value):
         rid=str(value.get("id") or ""); action=str(value.get("action") or "")
         if action not in ("delete-record","delete-all-records"): raise ValueError("未知秒传记录操作")
@@ -866,13 +876,18 @@ class Application:
             except BaseException as exc: result["error"]=exc
             finally: finished.set()
         threading.Thread(target=worker,daemon=True,name="transfer-call").start()
-        timeout=max(30,min(3600,int(timeout_seconds or 300)))
+        timeout=max(0.1,min(3600.0,float(timeout_seconds or 300)))
         if not finished.wait(timeout): raise TimeoutError(f"秒传超过 {timeout} 秒，任务已暂停并等待稍后重试")
         if "error" in result: raise result["error"]
         return result.get("value")
 
     def transfer_delivery(self,cfg,item,target_cookie):
-        timeout=cfg.get("transfer_timeout_seconds",300)
+        timeout=max(30,min(3600,int(cfg.get("transfer_timeout_seconds") or 300)))
+        deadline=time.monotonic()+timeout
+        def remaining_timeout():
+            remaining=deadline-time.monotonic()
+            if remaining<=0: raise TimeoutError(f"秒传超过 {timeout} 秒，任务已暂停并等待稍后重试")
+            return remaining
         target_label=self.user_label(item)
         relay_errors=[]
         if cfg.get("distributed_transfer_enabled"):
@@ -884,7 +899,7 @@ class Application:
                         if not relay_entry: raise FileNotFoundError("成功账号中未找到文件，可能已删除或改名")
                         relay_entry["name"]=item["name"]
                         return P115.transfer(relay["cookie"],target_cookie,relay_entry,item["target_cid"])
-                    self.timed_call(relay_action,timeout)
+                    self.timed_call(relay_action,remaining_timeout())
                     self.store.event("接力秒传",f"{relay_label} → {target_label}：{item['name']} 成功",item["id"])
                     return f"接力：{relay_label}"
                 except TimeoutError:
@@ -894,8 +909,10 @@ class Application:
                     self.store.event("接力跳过",f"{relay_label} → {target_label}：{item['name']}；{error}",item["id"])
         source_cookie=self.store.source_cookie(item["source_id"],cfg["source_cookie"])
         if not source_cookie: raise RuntimeError("资源所属监听目录没有可用的 115 CK")
+        if relay_errors:
+            self.store.event("接力回退",f"{target_label}：接力账号均不可用，改用源账号；{item['name']}",item["id"])
         try:
-            self.timed_call(lambda:P115.transfer(source_cookie,target_cookie,item,item["target_cid"]),timeout)
+            self.timed_call(lambda:P115.transfer(source_cookie,target_cookie,item,item["target_cid"]),remaining_timeout())
             return "主源账号" if not relay_errors else "主源回退"
         except Exception as exc:
             error=self.transfer_error(exc)
@@ -1160,6 +1177,10 @@ class Application:
                   (done,due,age_delete,retention,item["resource_id"]))
             target_label=self.user_label(item)
             self.store.event("派送",f"{target_label}：{item['name']}；来源 {transfer_source}",item["id"])
+            if cfg.get("distributed_transfer_enabled"):
+                woken=self.store.wake_relay_retries(item["resource_id"],item["id"])
+                if woken:
+                    self.store.event("接力唤醒",f"{target_label} 已接收成功，立即唤醒 {woken} 个错误任务：{item['name']}",item["id"])
             self.telegram.send(item["tg_id"], f"✅ <b>派送完成</b>\n{item['name']}", False)
         except Exception as exc:
             failed=now(); attempts=int(item.get("attempts") or 0)+1; max_attempts=max(1,min(50,int(cfg.get("max_attempts") or 5)))
