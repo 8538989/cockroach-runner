@@ -90,6 +90,10 @@ class Store:
                 ("sources","cd2_path","TEXT NOT NULL DEFAULT ''"),
                 ("sources","age_delete_minutes","INTEGER NOT NULL DEFAULT -1"),
                 ("resources","hidden","INTEGER NOT NULL DEFAULT 0"),
+                ("users","membership_expires","INTEGER NOT NULL DEFAULT 0"),
+                ("users","membership_plan","TEXT NOT NULL DEFAULT ''"),
+                ("bindings","plan","TEXT NOT NULL DEFAULT 'month'"),
+                ("bindings","grant_days","INTEGER NOT NULL DEFAULT 30"),
             ):
                 columns = {row[1] for row in self.db.execute(f"PRAGMA table_info({table})")}
                 if column not in columns: self.db.execute(f"ALTER TABLE {table} ADD COLUMN {column} {definition}")
@@ -159,9 +163,9 @@ class Store:
     def upsert_user(self, tg_id, username="", name=""):
         stamp = now()
         with self.lock, self.db:
-            self.db.execute("""INSERT INTO users(tg_id,username,name,created,updated) VALUES(?,?,?,?,?)
+            self.db.execute("""INSERT INTO users(tg_id,username,name,membership_expires,membership_plan,created,updated) VALUES(?,?,?,?,?,?,?)
               ON CONFLICT(tg_id) DO UPDATE SET username=excluded.username,name=excluded.name,updated=excluded.updated""",
-              (tg_id, username or "", name or "", stamp, stamp))
+              (tg_id, username or "", name or "", stamp+365*86400, "year", stamp, stamp))
         return self.user(tg_id)
 
     def ensure_legacy_source(self):
@@ -260,20 +264,29 @@ class Store:
             else: raise ValueError("未知监听目录操作")
         self.event("监听目录", "删除监听目录" if action == "delete" else "重建历史基线", sid)
 
-    def create_binding(self, minutes=30):
+    def create_binding(self, plan="month"):
+        plans = {"month": (30, "月度"), "quarter": (90, "季度"), "year": (365, "年度")}
+        if plan not in plans: raise ValueError("会员时长无效")
+        grant_days, plan_name = plans[plan]
         code = "-".join(secrets.token_hex(3).upper()[i:i+3] for i in (0,3))
         stamp=now(); bid=secrets.token_hex(12); digest=hashlib.sha256(code.encode()).hexdigest()
         with self.lock, self.db:
-            self.db.execute("INSERT INTO bindings(id,code_hash,code_hint,expires,created) VALUES(?,?,?,?,?)", (bid,digest,code[-3:],stamp+max(5,min(1440,int(minutes)))*60,stamp))
-        self.event("绑定", "创建绑定码", bid); return {"id":bid,"code":code,"expires":stamp+max(5,min(1440,int(minutes)))*60}
+            self.db.execute("INSERT INTO bindings(id,code_hash,code_hint,expires,plan,grant_days,created) VALUES(?,?,?,?,?,?,?)", (bid,digest,code[-3:],stamp+86400,plan,grant_days,stamp))
+        self.event("绑定", f"创建{plan_name}会员码", bid); return {"id":bid,"code":code,"expires":stamp+86400,"plan":plan,"grant_days":grant_days}
 
     def consume_binding(self, code, tg_id):
         digest=hashlib.sha256(str(code).strip().upper().encode()).hexdigest(); stamp=now()
         with self.lock, self.db:
             row=self.db.execute("SELECT * FROM bindings WHERE code_hash=?",(digest,)).fetchone()
             if not row or row["status"] != "available" or row["expires"] < stamp: raise ValueError("绑定码无效或已过期")
+            current=self.db.execute("SELECT membership_expires FROM users WHERE tg_id=?",(tg_id,)).fetchone()
+            membership_expires=max(stamp,int(current[0] or 0) if current else 0)+int(row["grant_days"])*86400
+            self.db.execute("""INSERT INTO users(tg_id,membership_expires,membership_plan,created,updated) VALUES(?,?,?,?,?)
+              ON CONFLICT(tg_id) DO UPDATE SET membership_expires=excluded.membership_expires,
+              membership_plan=excluded.membership_plan,updated=excluded.updated""",
+              (tg_id,membership_expires,row["plan"],stamp,stamp))
             self.db.execute("UPDATE bindings SET status='used',used_by=? WHERE id=?",(str(tg_id),row["id"]))
-        return row["id"]
+        return {"id":row["id"],"membership_expires":membership_expires,"plan":row["plan"]}
 
     def binding_action(self, value):
         bid=str(value.get("id") or ""); action=str(value.get("action") or "")
@@ -315,7 +328,7 @@ class Store:
               SUM(CASE WHEN d.status IN ('cancelled','failed') THEN 1 ELSE 0 END) delivery_failed
               FROM resources r LEFT JOIN deliveries d ON d.resource_id=r.id
               WHERE r.hidden=0 GROUP BY r.id ORDER BY r.first_seen DESC LIMIT 200""")]
-            bindings=[dict(row) for row in self.db.execute("SELECT id,code_hint,expires,status,used_by,created FROM bindings ORDER BY created DESC LIMIT 100")]
+            bindings=[dict(row) for row in self.db.execute("SELECT id,code_hint,expires,status,used_by,created,plan,grant_days FROM bindings ORDER BY created DESC LIMIT 100")]
             events=[dict(row) for row in self.db.execute("SELECT * FROM events ORDER BY created DESC LIMIT 200")]
         return {**self.status(),"users_list":users,"deliveries":deliveries,"sources":self.sources(),"resources":resources,"bindings":bindings,"events":events}
 
@@ -387,11 +400,12 @@ class Telegram:
             parts=text.split(maxsplit=1)
             if len(parts)<2: return self.send(tg_id,"请发送 <code>/bind 绑定码</code>。绑定码由管理员创建。",False)
             try:
-                self.app.store.consume_binding(parts[1],tg_id)
+                membership=self.app.store.consume_binding(parts[1],tg_id)
                 user=self.app.store.upsert_user(tg_id,sender.get("username",""),name)
                 self.app.store.event("绑定",f"Telegram 用户完成绑定：{tg_id}",str(tg_id))
             except ValueError as exc: return self.send(tg_id,str(exc),False)
-            self.send(sender["id"], "<b>蟑螂快跑已连接</b>\n无需门户或 Emby 认证。点击下方按钮绑定115并设置接收规则。")
+            expires=time.strftime("%Y-%m-%d %H:%M",time.localtime(membership["membership_expires"]))
+            self.send(sender["id"], f"<b>蟑螂快跑已连接</b>\n会员有效期至：{expires}\n点击下方按钮绑定115并设置接收规则。")
         elif text.startswith("/start"):
             if not user: return self.send(tg_id,"尚未绑定。请向管理员索取绑定码，然后发送 <code>/bind 绑定码</code>。",False)
             self.app.store.upsert_user(tg_id,sender.get("username",""),name)
@@ -836,7 +850,7 @@ class Application:
         return ""
 
     def queue_resource(self,rid,name,category,stamp):
-        users=self.store.db.execute("SELECT * FROM users WHERE enabled=1 AND status='active' AND cookie<>''").fetchall()
+        users=self.store.db.execute("SELECT * FROM users WHERE enabled=1 AND status='active' AND cookie<>'' AND membership_expires>?",(stamp,)).fetchall()
         for user in users:
             if self.matches(dict(user),name,category):
                 did=hashlib.sha256(f"{rid}:{user['tg_id']}".encode()).hexdigest()
@@ -859,8 +873,8 @@ class Application:
         with self.store.lock:
             rows = self.store.db.execute("""SELECT d.id,d.resource_id,d.tg_id,d.attempts,r.*,u.cookie,u.target_cid
               FROM deliveries d JOIN resources r ON r.id=d.resource_id JOIN users u ON u.tg_id=d.tg_id
-              WHERE d.status IN ('waiting','retry') AND d.attempts<? AND d.next_attempt<=? AND u.status='active'
-              ORDER BY d.created LIMIT 20""",(max_attempts,stamp)).fetchall()
+              WHERE d.status IN ('waiting','retry') AND d.attempts<? AND d.next_attempt<=? AND u.status='active' AND u.enabled=1 AND u.membership_expires>?
+              ORDER BY d.created LIMIT 20""",(max_attempts,stamp,stamp)).fetchall()
         workers=max(1,min(8,int(cfg.get("concurrency") or 1)))
         if workers==1:
             for row in rows: self.deliver_one(cfg,dict(row))
@@ -982,7 +996,7 @@ class Handler(BaseHTTPRequestHandler):
             if path == "/api/admin/bindings" and method == "POST":
                 self.admin(); value=self.body()
                 if value.get("action")=="revoke": self.app.store.binding_action(value); return self.send_json(200,{"message":"绑定码已撤销"})
-                result=self.app.store.create_binding(value.get("minutes",30)); return self.send_json(200,{"message":"绑定码已创建",**result})
+                result=self.app.store.create_binding(str(value.get("plan") or "month")); return self.send_json(200,{"message":"会员绑定码已创建",**result})
             if path == "/api/admin/test-bot" and method == "POST": self.admin(); info=self.app.telegram.call("getMe"); return self.send_json(200, {**self.app.store.status(), "message": f"Bot 连接正常：@{info.get('username','')}"})
             if path == "/api/admin/scan" and method == "POST": self.admin(); threading.Thread(target=self.app.scan,daemon=True).start(); return self.send_json(202, {**self.app.store.status(), "message": "扫描已启动"})
             if path == "/api/mini/me" and method == "GET": uid=self.mini(); return self.send_json(200, {"user": self.app.store.user(uid), "categories": ["电影","剧集","动漫","纪录片","其他"], "qr_apps": QR_LOGIN_APPS})

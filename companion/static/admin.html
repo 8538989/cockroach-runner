@@ -44,7 +44,7 @@
 
       <section id="usersPanel" class="panel active">
         <div class="section-head"><div><h2>用户管理</h2><p>管理账号状态、目标目录、订阅规则和搜索额度。</p></div><button class="refresh">刷新</button></div>
-        <div class="table-wrap"><table><thead><tr><th>用户</th><th>115 / CK</th><th>目标目录</th><th>订阅</th><th>状态</th><th></th></tr></thead><tbody id="usersBody"></tbody></table></div>
+        <div class="table-wrap"><table><thead><tr><th>用户</th><th>115 / CK</th><th>会员有效期</th><th>目标目录</th><th>订阅</th><th>状态</th><th></th></tr></thead><tbody id="usersBody"></tbody></table></div>
       </section>
 
       <section id="deliveriesPanel" class="panel">
@@ -58,10 +58,10 @@
       </section>
 
       <section id="bindingsPanel" class="panel">
-        <div class="section-head"><div><h2>一次性绑定码</h2><p>用户在 Telegram Bot 中发送 <code>/bind 绑定码</code> 后获得访问权。</p></div><button class="refresh">刷新</button></div>
-        <div class="inline-form"><label class="field"><span>有效期（分钟）</span><input id="bindingMinutes" type="number" min="5" max="1440" value="30"></label><button id="createBinding" class="primary">生成绑定码</button></div>
+        <div class="section-head"><div><h2>会员绑定码</h2><p>用户发送 <code>/bind 绑定码</code> 后开通或顺延会员；绑定码本身 24 小时内有效。</p></div><button class="refresh">刷新</button></div>
+        <div class="inline-form"><label class="field"><span>会员时长</span><select id="bindingPlan"><option value="month">月度会员（30 天）</option><option value="quarter">季度会员（90 天）</option><option value="year">年度会员（365 天）</option></select></label><button id="createBinding" class="primary">生成会员码</button></div>
         <div id="bindingResult" class="binding-result" hidden></div>
-        <div class="table-wrap"><table><thead><tr><th>尾号</th><th>状态</th><th>使用者</th><th>到期时间</th><th></th></tr></thead><tbody id="bindingsBody"></tbody></table></div>
+        <div class="table-wrap"><table><thead><tr><th>尾号</th><th>会员时长</th><th>状态</th><th>使用者</th><th>兑换截止</th><th></th></tr></thead><tbody id="bindingsBody"></tbody></table></div>
       </section>
 
       <section id="cleanupPanel" class="panel">
@@ -110,6 +110,7 @@
       <div class="grid">
         <label class="field"><span>状态</span><select id="userStatus"><option value="active">正常</option><option value="disabled">停用</option></select></label>
         <label class="field"><span>搜索额度</span><input id="userSearchLimit" type="number" min="1" max="1000"></label>
+        <label class="field"><span>会员到期时间</span><input id="userMembershipExpires" readonly></label>
         <label class="field"><span>目标目录 CID</span><div class="input-action"><input id="userTargetCid"><button type="button" id="pickUser115">选择文件夹</button></div></label>
         <label class="field"><span>目标目录名称</span><input id="userTargetName"></label>
         <label class="field"><span>订阅模式</span><select id="userMode"><option value="all">全部资源</option><option value="category">指定分类</option><option value="keyword">关键词</option></select></label>

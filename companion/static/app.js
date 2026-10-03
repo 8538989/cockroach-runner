@@ -38,6 +38,13 @@ const time = (stamp) => stamp ? new Date(stamp * 1000).toLocaleString("zh-CN", {
   minute: "2-digit",
 }) : "未记录";
 
+function membership(expires) {
+  const seconds = Number(expires || 0) - Math.floor(Date.now() / 1000);
+  if (seconds <= 0) return {active: false, text: "会员已到期", days: 0};
+  const days = Math.ceil(seconds / 86400);
+  return {active: true, text: `会员剩余 ${days} 天`, days};
+}
+
 async function api(path, method = "GET", body) {
   const response = await fetch(path, {
     method,
@@ -222,12 +229,18 @@ function shell(content) {
 
 function home() {
   const user = state.profile;
+  const member = membership(user.membership_expires);
   const stats = state.overview.stats || {};
   const recent = state.overview.deliveries.slice(0, 3);
   return shell(`<section class="panel hero-panel">
-    <span class="badge green">Telegram 已连接</span>
+    <span class="badge ${member.active ? "green" : "red"}">${esc(member.text)}</span>
     <h1>晚上好，${esc(user.name || user.username || "朋友")}</h1>
     <p>这里已经接入你的自制小程序风格，用来管理 115 账号、自动接收规则和派送记录。</p>
+  </section>
+  <section class="panel membership-panel ${member.active ? "" : "expired-membership"}">
+    <div><small>会员有效期</small><strong>${esc(member.text)}</strong></div>
+    <span>${esc(time(user.membership_expires))}</span>
+    ${member.active ? "" : "<p>会员到期后自动派送已暂停，请使用新的绑定码续费。</p>"}
   </section>
   <section class="stat-grid">
     <div class="stat"><span>已完成派送</span><strong>${stats.delivered || 0}</strong></div>

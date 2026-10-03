@@ -11,6 +11,7 @@ const labels = {
   blocked: '删除失败', available: '可用', used: '已使用', revoked: '已撤销', expired: '已过期',
   partial: '部分完成',
 }
+const planLabels = {month: '月度（30 天）', quarter: '季度（90 天）', year: '年度（365 天）'}
 
 function escapeHtml(value) {
   return String(value ?? '').replace(/[&<>"']/g, char => ({
@@ -21,6 +22,13 @@ function escapeHtml(value) {
 function formatTime(value) {
   if (!value) return '—'
   return new Date(Number(value) * 1000).toLocaleString('zh-CN', {hour12: false})
+}
+
+function membershipText(expires) {
+  const seconds = Number(expires || 0) - Math.floor(Date.now() / 1000)
+  if (seconds <= 0) return '已到期'
+  const days = Math.ceil(seconds / 86400)
+  return `剩余 ${days} 天`
 }
 
 function badge(value) {
@@ -106,16 +114,18 @@ function renderUsers(users = []) {
     const account = user.account_bound ? `UID ${escapeHtml(user.uid || '已绑定')}` : '未绑定'
     const mode = user.mode === 'category' ? `分类：${(user.categories || []).join('、') || '未选'}`
       : user.mode === 'keyword' ? `关键词：${user.include_terms || '未填'}` : '全部资源'
-    const state = user.status === 'disabled' || !user.enabled ? 'disabled' : 'active'
+    const expired = Number(user.membership_expires || 0) <= Math.floor(Date.now() / 1000)
+    const state = expired ? 'expired' : user.status === 'disabled' || !user.enabled ? 'disabled' : 'active'
     return `<tr>
       <td><strong>${escapeHtml(name)}</strong><small>@${escapeHtml(user.username || '—')} · ${escapeHtml(user.tg_id)}</small></td>
       <td>${escapeHtml(account)}<small>CK：${escapeHtml(labels[user.ck_status] || user.ck_status || '未知')}</small>${user.cookie ? `<details class="cookie-details"><summary>显示完整 CK</summary><code>${escapeHtml(user.cookie)}</code></details>` : ''}</td>
+      <td>${escapeHtml(membershipText(user.membership_expires))}<small>${escapeHtml(formatTime(user.membership_expires))}</small></td>
       <td>${escapeHtml(user.target_name || '根目录')}<small>CID ${escapeHtml(user.target_cid || '0')}</small></td>
       <td>${escapeHtml(mode)}<small>搜索额度 ${escapeHtml(user.search_limit ?? 20)}</small></td>
       <td>${badge(state)}</td>
       <td><div class="row-actions"><button class="small-button" data-action="edit-user" data-id="${escapeHtml(user.tg_id)}">编辑</button><button class="small-button danger-button" data-action="delete-user" data-id="${escapeHtml(user.tg_id)}">删除</button></div></td>
     </tr>`
-  }).join('') : emptyRow(6)
+  }).join('') : emptyRow(7)
 }
 
 function renderDeliveries(items = []) {
@@ -157,9 +167,9 @@ function renderSources(items = []) {
 
 function renderBindings(items = []) {
   $('bindingsBody').innerHTML = items.length ? items.map(item => `<tr>
-    <td>***-${escapeHtml(item.code_hint)}</td><td>${badge(item.status)}</td><td>${escapeHtml(item.used_by || '—')}</td><td>${escapeHtml(formatTime(item.expires))}</td>
+    <td>***-${escapeHtml(item.code_hint)}</td><td>${escapeHtml(planLabels[item.plan] || `${item.grant_days || 30} 天`)}</td><td>${badge(item.status)}</td><td>${escapeHtml(item.used_by || '—')}</td><td>${escapeHtml(formatTime(item.expires))}</td>
     <td>${item.status === 'available' ? `<button class="small-button danger-button" data-action="revoke-binding" data-id="${escapeHtml(item.id)}">撤销</button>` : ''}</td>
-  </tr>`).join('') : emptyRow(5)
+  </tr>`).join('') : emptyRow(6)
 }
 
 function renderResources(items = [], sources = []) {
@@ -218,6 +228,7 @@ function openUser(id) {
   $('userTgId').value = user.tg_id
   $('userStatus').value = user.status || 'active'
   $('userSearchLimit').value = user.search_limit ?? 20
+  $('userMembershipExpires').value = `${formatTime(user.membership_expires)}（${membershipText(user.membership_expires)}）`
   $('userTargetCid').value = user.target_cid || '0'
   $('userTargetName').value = user.target_name || '根目录'
   $('userMode').value = user.mode || 'all'
@@ -387,8 +398,8 @@ $('scan').addEventListener('click', () => perform(async () => {
 }))
 
 $('createBinding').addEventListener('click', () => perform(async () => {
-  const data = await api('/api/admin/bindings', 'POST', {minutes: Number($('bindingMinutes').value || 30)})
-  $('bindingResult').innerHTML = `新绑定码：<strong>${escapeHtml(data.code)}</strong><small>到期时间：${escapeHtml(formatTime(data.expires))}，离开本页后不再显示完整码。</small>`
+  const data = await api('/api/admin/bindings', 'POST', {plan: $('bindingPlan').value})
+  $('bindingResult').innerHTML = `新${escapeHtml(planLabels[data.plan] || `${data.grant_days} 天`)}会员码：<strong>${escapeHtml(data.code)}</strong><small>兑换截止：${escapeHtml(formatTime(data.expires))}。续费会从现有到期日顺延，离开本页后不再显示完整码。</small>`
   $('bindingResult').hidden = false
   await refresh(false)
 }, '绑定码已创建'))

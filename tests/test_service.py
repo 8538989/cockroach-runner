@@ -43,12 +43,38 @@ class ScanTests(unittest.TestCase):
     def test_binding_code_is_single_use(self):
         with tempfile.TemporaryDirectory() as data_dir:
             store = service.Store(data_dir, Fernet.generate_key().decode())
-            binding = store.create_binding(30)
-            store.consume_binding(binding["code"], 123)
+            binding = store.create_binding("quarter")
+            result = store.consume_binding(binding["code"], 123)
+            self.assertEqual((binding["grant_days"], result["plan"]), (90, "quarter"))
+            self.assertGreaterEqual(store.user(123)["membership_expires"], service.now() + 90 * 86400 - 2)
             with self.assertRaisesRegex(ValueError, "无效或已过期"):
                 store.consume_binding(binding["code"], 456)
             row = store.db.execute("SELECT status,used_by FROM bindings WHERE id=?", (binding["id"],)).fetchone()
             self.assertEqual((row["status"], row["used_by"]), ("used", "123"))
+            store.db.close()
+
+    def test_expired_member_is_not_queued_or_delivered(self):
+        with tempfile.TemporaryDirectory() as data_dir:
+            store = service.Store(data_dir, Fernet.generate_key().decode())
+            store.upsert_user(123)
+            store.save_user(123, {"cookie": "target", "uid": "u1"})
+            stamp = service.now()
+            with store.db:
+                store.db.execute("UPDATE users SET membership_expires=? WHERE tg_id=123", (stamp - 1,))
+                store.db.execute("INSERT INTO resources(id,node_id,name,first_seen) VALUES('expired-resource','1','Expired.mkv',?)", (stamp,))
+            app = service.Application(store)
+            app.queue_resource("expired-resource", "Expired.mkv", "电影", stamp)
+            self.assertEqual(store.db.execute("SELECT COUNT(*) FROM deliveries WHERE tg_id=123").fetchone()[0], 0)
+            store.db.close()
+
+    def test_membership_renewal_extends_from_current_expiry(self):
+        with tempfile.TemporaryDirectory() as data_dir:
+            store = service.Store(data_dir, Fernet.generate_key().decode())
+            store.upsert_user(123)
+            original = store.user(123)["membership_expires"]
+            binding = store.create_binding("month")
+            result = store.consume_binding(binding["code"], 123)
+            self.assertEqual(result["membership_expires"], original + 30 * 86400)
             store.db.close()
 
     def test_mini_overview_is_scoped_to_current_user(self):
