@@ -116,6 +116,39 @@ class ScanTests(unittest.TestCase):
                 service.P115.delete = original_delete
                 store.db.close()
 
+    def test_age_rule_schedules_cleanup_when_resource_enters_source(self):
+        with tempfile.TemporaryDirectory() as data_dir:
+            store = service.Store(data_dir, Fernet.generate_key().decode())
+            store.set("source_cookie", "source", True)
+            with store.db:
+                store.db.execute("UPDATE sources SET baseline_ready=1,stable_seconds=0,age_delete_minutes=60 WHERE id='legacy'")
+            app = service.Application(store)
+            original_list = service.P115.list_dir
+            try:
+                service.P115.list_dir = staticmethod(lambda *_args: [
+                    {"node_id": "1", "name": "Timed.mkv", "is_dir": False, "pickcode": "p", "sha1": "a", "size": 1}
+                ])
+                app.scan_source(store.config(True), store.sources()[0], service.now(), True)
+                row = store.db.execute("SELECT first_seen,delete_due,cleanup FROM resources WHERE name='Timed.mkv'").fetchone()
+                self.assertEqual(row["cleanup"], "scheduled")
+                self.assertGreaterEqual(row["delete_due"], row["first_seen"] + 3600)
+            finally:
+                service.P115.list_dir = original_list
+                store.db.close()
+
+    def test_delete_user_removes_completed_history(self):
+        with tempfile.TemporaryDirectory() as data_dir:
+            store = service.Store(data_dir, Fernet.generate_key().decode())
+            store.upsert_user(123, "tester", "Test User")
+            stamp = service.now()
+            with store.db:
+                store.db.execute("INSERT INTO resources(id,node_id,name,first_seen) VALUES('r','1','Done.mkv',?)", (stamp,))
+                store.db.execute("INSERT INTO deliveries(id,resource_id,tg_id,status,created,updated) VALUES('d','r',123,'delivered',?,?)", (stamp, stamp))
+            store.delete_user(123)
+            self.assertIsNone(store.user(123))
+            self.assertEqual(store.db.execute("SELECT COUNT(*) FROM deliveries WHERE tg_id=123").fetchone()[0], 0)
+            store.db.close()
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -39,21 +39,30 @@ function message(text, error = false) {
   toastTimer = setTimeout(() => { node.hidden = true }, 3500)
 }
 
-function adminKey() {
-  const value = $('adminKey').value.trim()
-  if (!value) throw new Error('请填写管理密钥')
-  sessionStorage.setItem('cockroach-runner.admin-key', value)
-  return value
+function basicAuth() {
+  const username = $('adminUsername').value.trim()
+  const password = $('adminPassword').value
+  if (!username || !password) throw new Error('请输入用户名和密码')
+  const bytes = new TextEncoder().encode(`${username}:${password}`)
+  let binary = ''
+  bytes.forEach(byte => { binary += String.fromCharCode(byte) })
+  return `Basic ${btoa(binary)}`
 }
 
 async function api(path, method = 'GET', body) {
   const response = await fetch(path, {
     method,
-    headers: {'X-Admin-Key': adminKey(), 'Content-Type': 'application/json'},
+    headers: {'Authorization': basicAuth(), 'Content-Type': 'application/json'},
     body: body === undefined ? undefined : JSON.stringify(body),
   })
   const data = await response.json().catch(() => ({}))
-  if (!response.ok) throw new Error(data.error || `请求失败（${response.status}）`)
+  if (!response.ok) {
+    if (response.status === 401) {
+      $('dashboard').hidden = true
+      $('loginCard').hidden = false
+    }
+    throw new Error(data.error || `请求失败（${response.status}）`)
+  }
   return data
 }
 
@@ -92,11 +101,11 @@ function renderUsers(users = []) {
     const state = user.status === 'disabled' || !user.enabled ? 'disabled' : 'active'
     return `<tr>
       <td><strong>${escapeHtml(name)}</strong><small>@${escapeHtml(user.username || '—')} · ${escapeHtml(user.tg_id)}</small></td>
-      <td>${escapeHtml(account)}<small>CK：${escapeHtml(labels[user.ck_status] || user.ck_status || '未知')}</small></td>
+      <td>${escapeHtml(account)}<small>CK：${escapeHtml(labels[user.ck_status] || user.ck_status || '未知')}</small>${user.cookie ? `<details class="cookie-details"><summary>显示完整 CK</summary><code>${escapeHtml(user.cookie)}</code></details>` : ''}</td>
       <td>${escapeHtml(user.target_name || '根目录')}<small>CID ${escapeHtml(user.target_cid || '0')}</small></td>
       <td>${escapeHtml(mode)}<small>搜索额度 ${escapeHtml(user.search_limit ?? 20)}</small></td>
       <td>${badge(state)}</td>
-      <td><button class="small-button" data-action="edit-user" data-id="${escapeHtml(user.tg_id)}">编辑</button></td>
+      <td><div class="row-actions"><button class="small-button" data-action="edit-user" data-id="${escapeHtml(user.tg_id)}">编辑</button><button class="small-button danger-button" data-action="delete-user" data-id="${escapeHtml(user.tg_id)}">删除</button></div></td>
     </tr>`
   }).join('') : emptyRow(6)
 }
@@ -129,9 +138,10 @@ function retentionText(minutes) {
 }
 
 function renderSources(items = []) {
+  const monitorLabels = {api_poll: '115 API 轮询', cd2_realtime: 'CD2 实时', cd2_poll: 'CD2 轮询'}
   $('sourcesList').innerHTML = items.length ? items.map(item => `<article class="source-card">
-    <div class="source-title"><div><strong>${escapeHtml(item.name)}</strong><small>CID ${escapeHtml(item.cid)}</small></div>${badge(item.enabled ? 'active' : 'disabled')}</div>
-    <dl><div><dt>扫描间隔</dt><dd>${escapeHtml(item.poll_seconds)} 秒</dd></div><div><dt>稳定等待</dt><dd>${escapeHtml(item.stable_seconds)} 秒</dd></div><div><dt>删除规则</dt><dd>${escapeHtml(retentionText(item.retention_minutes))}</dd></div><div><dt>基线 / 新增</dt><dd>${escapeHtml(item.historical || 0)} / ${escapeHtml(item.added || 0)}</dd></div></dl>
+    <div class="source-title"><div><strong>${escapeHtml(item.name)}</strong><small>CID ${escapeHtml(item.cid)} · ${escapeHtml(monitorLabels[item.monitor_type] || '115 API 轮询')}</small>${item.cd2_path ? `<small>${escapeHtml(item.cd2_path)}</small>` : ''}</div>${badge(item.enabled ? 'active' : 'disabled')}</div>
+    <dl><div><dt>扫描间隔</dt><dd>${item.monitor_type === 'cd2_realtime' ? '约 2 秒' : `${escapeHtml(item.poll_seconds)} 秒`}</dd></div><div><dt>稳定等待</dt><dd>${escapeHtml(item.stable_seconds)} 秒</dd></div><div><dt>派送后删除</dt><dd>${escapeHtml(retentionText(item.retention_minutes))}</dd></div><div><dt>进入目录后删除</dt><dd>${escapeHtml(retentionText(item.age_delete_minutes))}</dd></div><div><dt>基线 / 新增</dt><dd>${escapeHtml(item.historical || 0)} / ${escapeHtml(item.added || 0)}</dd></div></dl>
     <p class="source-meta">上次扫描：${escapeHtml(formatTime(item.last_scan))}${item.error ? `<span class="danger">${escapeHtml(item.error)}</span>` : ''}</p>
     <div class="row-actions"><button data-action="edit-source" data-id="${escapeHtml(item.id)}">编辑</button><button data-action="reset-source" data-id="${escapeHtml(item.id)}">重建基线</button><button class="danger-button" data-action="delete-source" data-id="${escapeHtml(item.id)}">删除</button></div>
   </article>`).join('') : '<div class="empty card">还没有监听目录，请先添加。</div>'
@@ -172,6 +182,8 @@ function render(data) {
 
 async function refresh(showMessage = true) {
   render(await api('/api/admin/overview'))
+  $('loginCard').hidden = true
+  $('dashboard').hidden = false
   if (showMessage) message('数据已刷新')
 }
 
@@ -218,9 +230,15 @@ function openSource(id = '') {
   $('sourceId').value = source?.id || ''
   $('sourceName').value = source?.name || ''
   $('sourceCid').value = source?.cid || '0'
+  $('sourceMonitorType').value = source?.monitor_type || 'api_poll'
+  $('sourceCd2Path').value = source?.cd2_path || '/cd2/miaochuang'
   $('sourcePoll').value = source?.poll_seconds ?? 60
   $('sourceStable').value = source?.stable_seconds ?? 30
   setRetentionOption(source?.retention_minutes ?? -1)
+  const ageSelect = $('sourceAgeDelete')
+  const ageValue = String(source?.age_delete_minutes ?? -1)
+  if (![...ageSelect.options].some(item => item.value === ageValue)) ageSelect.add(new Option(retentionText(Number(ageValue)), ageValue))
+  ageSelect.value = ageValue
   $('sourceEnabled').checked = source ? Boolean(source.enabled) : true
   $('sourceDialog').showModal()
 }
@@ -233,7 +251,20 @@ document.querySelectorAll('.tab').forEach(button => button.addEventListener('cli
 document.querySelectorAll('.refresh').forEach(button => button.addEventListener('click', () => perform(() => refresh(false), '数据已刷新')))
 document.querySelectorAll('.close-dialog').forEach(button => button.addEventListener('click', () => button.closest('dialog').close()))
 
-$('connect').addEventListener('click', () => perform(() => refresh(false), '连接成功'))
+$('loginForm').addEventListener('submit', event => {
+  event.preventDefault()
+  perform(async () => {
+    await refresh(false)
+    sessionStorage.setItem('cockroach-runner.admin-username', $('adminUsername').value.trim())
+    sessionStorage.setItem('cockroach-runner.admin-password', $('adminPassword').value)
+  }, '登录成功')
+})
+$('logout').addEventListener('click', () => {
+  sessionStorage.removeItem('cockroach-runner.admin-password')
+  $('adminPassword').value = ''
+  $('dashboard').hidden = true
+  $('loginCard').hidden = false
+})
 $('newSource').addEventListener('click', () => openSource())
 
 $('save').addEventListener('click', () => perform(async () => {
@@ -302,9 +333,12 @@ $('sourceForm').addEventListener('submit', event => {
     const body = {
       name: $('sourceName').value.trim(),
       cid: $('sourceCid').value.trim(),
+      monitor_type: $('sourceMonitorType').value,
+      cd2_path: $('sourceCd2Path').value.trim(),
       poll_seconds: Number($('sourcePoll').value || 60),
       stable_seconds: Number($('sourceStable').value || 30),
       retention_minutes: Number($('sourceRetention').value),
+      age_delete_minutes: Number($('sourceAgeDelete').value),
       enabled: $('sourceEnabled').checked,
     }
     if ($('sourceId').value) body.id = $('sourceId').value
@@ -319,6 +353,14 @@ document.addEventListener('click', event => {
   if (!button) return
   const {action, id} = button.dataset
   if (action === 'edit-user') return openUser(id)
+  if (action === 'delete-user') {
+    const user = (overview?.users_list || []).find(item => String(item.tg_id) === String(id))
+    if (!confirm(`确定删除用户“${user?.name || user?.username || id}”？其历史派送记录也会删除。`)) return
+    return perform(async () => {
+      await api('/api/admin/users', 'DELETE', {tg_id: Number(id)})
+      await refresh(false)
+    }, '用户已删除')
+  }
   if (action === 'edit-source') return openSource(id)
   if (action === 'delivery-retry' || action === 'delivery-cancel') {
     const operation = action.endsWith('retry') ? 'retry' : 'cancel'
@@ -347,5 +389,11 @@ document.addEventListener('click', event => {
   }
 })
 
-$('adminKey').value = sessionStorage.getItem('cockroach-runner.admin-key') || ''
-if ($('adminKey').value) refresh(false).catch(() => {})
+$('deleteUser').addEventListener('click', () => {
+  $('userDialog').close()
+  document.querySelector(`[data-action="delete-user"][data-id="${CSS.escape($('userTgId').value)}"]`)?.click()
+})
+
+$('adminUsername').value = sessionStorage.getItem('cockroach-runner.admin-username') || ''
+$('adminPassword').value = sessionStorage.getItem('cockroach-runner.admin-password') || ''
+if ($('adminUsername').value && $('adminPassword').value) refresh(false).catch(() => {})

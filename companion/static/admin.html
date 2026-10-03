@@ -3,9 +3,8 @@
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width,initial-scale=1">
-  <meta name="theme-color" content="#0c120e">
+  <meta name="theme-color" content="#f4f7fb">
   <title>蟑螂快跑 · 管理中心</title>
-  <link rel="stylesheet" href="/style.css">
   <link rel="stylesheet" href="/admin.css">
 </head>
 <body>
@@ -15,12 +14,17 @@
       <div><h1>蟑螂快跑</h1><p>独立服务管理中心 · 不依赖 DIAN115</p></div>
     </header>
 
-    <section class="card connect-card">
-      <label class="field"><span>管理密钥</span><input id="adminKey" type="password" autocomplete="current-password" placeholder="COCKROACH_ADMIN_KEY"></label>
-      <div class="actions"><button id="connect" class="primary">连接并刷新</button><span id="connection" class="status">尚未连接</span></div>
+    <section id="loginCard" class="card login-card">
+      <div><h2>管理员登录</h2><p>请输入管理后台用户名和密码。</p></div>
+      <form id="loginForm" class="login-form">
+        <label class="field"><span>用户名</span><input id="adminUsername" autocomplete="username" required></label>
+        <label class="field"><span>密码</span><input id="adminPassword" type="password" autocomplete="current-password" required></label>
+        <button class="primary" type="submit">登录</button>
+      </form>
     </section>
 
     <section id="dashboard" hidden>
+      <div class="dashboard-bar"><span id="connection" class="status online">服务在线</span><button id="logout" class="ghost-button">退出登录</button></div>
       <div class="stats">
         <article class="card"><small>用户</small><strong id="users">0</strong></article>
         <article class="card"><small>待处理派送</small><strong id="pending">0</strong></article>
@@ -49,7 +53,7 @@
       </section>
 
       <section id="sourcesPanel" class="panel">
-        <div class="section-head"><div><h2>监听目录</h2><p>可独立设置扫描、文件稳定等待和源文件保留时间。</p></div><div class="head-actions"><button class="refresh">刷新</button><button id="newSource" class="primary">添加目录</button></div></div>
+        <div class="section-head"><div><h2>监听目录</h2><p>支持 115 API 轮询，以及 CD2 实时/轮询兜底监控。</p></div><div class="head-actions"><button class="refresh">刷新</button><button id="newSource" class="primary">添加目录</button></div></div>
         <div id="sourcesList" class="source-grid"></div>
       </section>
 
@@ -109,7 +113,7 @@
         <label class="field wide"><span>备注</span><textarea id="userNote" rows="2"></textarea></label>
       </div>
       <div class="checks"><label class="check"><input id="userEnabled" type="checkbox"> 接收派送</label><label class="check"><input id="userHierarchy" type="checkbox"> 保留目录层级</label></div>
-      <div class="dialog-actions"><button type="button" class="close-dialog">取消</button><button type="submit" class="primary">保存用户</button></div>
+      <div class="dialog-actions"><button type="button" id="deleteUser" class="danger-button">删除用户</button><span class="action-spacer"></span><button type="button" class="close-dialog">取消</button><button type="submit" class="primary">保存用户</button></div>
     </form>
   </dialog>
 
@@ -120,9 +124,12 @@
       <div class="grid">
         <label class="field"><span>名称</span><input id="sourceName" required></label>
         <label class="field"><span>目录 CID</span><input id="sourceCid" required></label>
+        <label class="field"><span>监听方式</span><select id="sourceMonitorType"><option value="api_poll">115 API 轮询</option><option value="cd2_realtime">CD2 实时监控（约 2 秒）</option><option value="cd2_poll">CD2 定时轮询</option></select></label>
+        <label class="field"><span>CD2 目录（容器内）</span><input id="sourceCd2Path" placeholder="/cd2/miaochuang/子目录"></label>
         <label class="field"><span>扫描间隔（秒）</span><input id="sourcePoll" type="number" min="15" max="3600" value="60"></label>
         <label class="field"><span>稳定等待（秒）</span><input id="sourceStable" type="number" min="0" max="86400" value="30"></label>
         <label class="field wide"><span>秒传成功后删除源文件</span><select id="sourceRetention"><option value="-1">永久保留（默认）</option><option value="0">立即删除</option><option value="10">10 分钟后</option><option value="60">1 小时后</option><option value="1440">1 天后</option><option value="10080">7 天后</option></select></label>
+        <label class="field wide"><span>文件进入监控目录后定时删除</span><select id="sourceAgeDelete"><option value="-1">不启用</option><option value="10">10 分钟后</option><option value="60">1 小时后</option><option value="360">6 小时后</option><option value="1440">1 天后</option><option value="4320">3 天后</option><option value="10080">7 天后</option></select><small>到期时仍会等待该文件的派送任务全部完成或取消，之后通过 115 API 删除。</small></label>
       </div>
       <label class="check"><input id="sourceEnabled" type="checkbox" checked> 启用监听</label>
       <div class="dialog-actions"><button type="button" class="close-dialog">取消</button><button type="submit" class="primary">保存目录</button></div>

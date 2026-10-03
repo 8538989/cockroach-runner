@@ -5,7 +5,8 @@ services:
     container_name: cockroach-runner
     restart: unless-stopped
     environment:
-      COCKROACH_ADMIN_KEY: ${COCKROACH_ADMIN_KEY:?请在 .env 中设置管理密钥}
+      COCKROACH_ADMIN_USERNAME: ${COCKROACH_ADMIN_USERNAME:?请在 .env 中设置管理员用户名}
+      COCKROACH_ADMIN_PASSWORD: ${COCKROACH_ADMIN_PASSWORD:?请在 .env 中设置管理员密码}
       COCKROACH_ENCRYPTION_KEY: ${COCKROACH_ENCRYPTION_KEY:?请在 .env 中设置 Fernet 密钥}
       HOME: /data
       XDG_CACHE_HOME: /data/.cache
@@ -14,6 +15,7 @@ services:
       - "${COCKROACH_BIND_IP:-127.0.0.1}:${COCKROACH_PORT:-8790}:8790"
     volumes:
       - "${COCKROACH_DATA_DIR:-cockroach-data}:/data"
+      - "${COCKROACH_CD2_PATH:-/CloudNAS/miaochuang}:/cd2/miaochuang:ro,rslave"
     security_opt:
       - no-new-privileges:true
 

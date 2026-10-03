@@ -74,6 +74,9 @@ class Store:
                 ("resources","first_success","INTEGER NOT NULL DEFAULT 0"), ("resources","delete_due","INTEGER NOT NULL DEFAULT 0"),
                 ("resources","cleanup","TEXT NOT NULL DEFAULT 'waiting'"), ("resources","cleanup_error","TEXT NOT NULL DEFAULT ''"),
                 ("deliveries","next_attempt","INTEGER NOT NULL DEFAULT 0"), ("deliveries","source","TEXT NOT NULL DEFAULT ''"),
+                ("sources","monitor_type","TEXT NOT NULL DEFAULT 'api_poll'"),
+                ("sources","cd2_path","TEXT NOT NULL DEFAULT ''"),
+                ("sources","age_delete_minutes","INTEGER NOT NULL DEFAULT -1"),
             ):
                 columns = {row[1] for row in self.db.execute(f"PRAGMA table_info({table})")}
                 if column not in columns: self.db.execute(f"ALTER TABLE {table} ADD COLUMN {column} {definition}")
@@ -163,6 +166,16 @@ class Store:
         else: value.pop("cookie", None); value["account_bound"] = bool(row["cookie"] and row["uid"])
         return value
 
+    def delete_user(self, tg_id):
+        with self.lock, self.db:
+            row = self.db.execute("SELECT name,username FROM users WHERE tg_id=?", (tg_id,)).fetchone()
+            if not row: raise ValueError("用户不存在")
+            active = self.db.execute("SELECT COUNT(*) FROM deliveries WHERE tg_id=? AND status IN ('waiting','running','retry')", (tg_id,)).fetchone()[0]
+            if active: raise ValueError("该用户仍有未完成派送，请先取消任务")
+            self.db.execute("DELETE FROM deliveries WHERE tg_id=?", (tg_id,))
+            self.db.execute("DELETE FROM users WHERE tg_id=?", (tg_id,))
+        self.event("用户管理", f"删除用户：{row['name'] or row['username'] or tg_id}", str(tg_id))
+
     def save_user(self, tg_id, value):
         current = self.user(tg_id, True)
         if not current: raise ValueError("用户不存在")
@@ -189,12 +202,23 @@ class Store:
         poll = max(15, min(3600, int(value.get("poll_seconds") or 60)))
         stable = max(0, min(86400, int(value.get("stable_seconds") or 30)))
         retention = max(-1, min(525600, int(value.get("retention_minutes", -1))))
+        age_delete = max(-1, min(525600, int(value.get("age_delete_minutes", -1))))
+        monitor_type = str(value.get("monitor_type") or "api_poll")
+        if monitor_type not in {"api_poll", "cd2_realtime", "cd2_poll"}: raise ValueError("监听方式无效")
+        cd2_path = str(value.get("cd2_path") or "").strip()
+        if monitor_type.startswith("cd2_"):
+            resolved = Path(cd2_path).resolve()
+            cd2_root = Path("/cd2/miaochuang").resolve()
+            if resolved != cd2_root and cd2_root not in resolved.parents: raise ValueError("CD2 路径必须位于 /cd2/miaochuang 内")
+            if not resolved.is_dir(): raise ValueError("CD2 监听目录不存在或容器无权访问")
+            cd2_path = str(resolved)
         with self.lock, self.db:
-            self.db.execute("""INSERT INTO sources(id,name,cid,enabled,poll_seconds,stable_seconds,retention_minutes,created,updated)
-              VALUES(?,?,?,?,?,?,?,?,?) ON CONFLICT(id) DO UPDATE SET name=excluded.name,cid=excluded.cid,
+            self.db.execute("""INSERT INTO sources(id,name,cid,enabled,poll_seconds,stable_seconds,retention_minutes,monitor_type,cd2_path,age_delete_minutes,created,updated)
+              VALUES(?,?,?,?,?,?,?,?,?,?,?,?) ON CONFLICT(id) DO UPDATE SET name=excluded.name,cid=excluded.cid,
               enabled=excluded.enabled,poll_seconds=excluded.poll_seconds,stable_seconds=excluded.stable_seconds,
-              retention_minutes=excluded.retention_minutes,updated=excluded.updated""",
-              (sid,name,cid,int(bool(value.get("enabled",True))),poll,stable,retention,stamp,stamp))
+              retention_minutes=excluded.retention_minutes,monitor_type=excluded.monitor_type,cd2_path=excluded.cd2_path,
+              age_delete_minutes=excluded.age_delete_minutes,updated=excluded.updated""",
+              (sid,name,cid,int(bool(value.get("enabled",True))),poll,stable,retention,monitor_type,cd2_path,age_delete,stamp,stamp))
         self.event("监听目录", f"保存监听目录：{name}", sid); return sid
 
     def source_action(self, value):
@@ -243,7 +267,8 @@ class Store:
         stamp=now()
         with self.lock, self.db:
             self.db.execute("UPDATE bindings SET status='expired' WHERE status='available' AND expires<?",(stamp,))
-            users=[self.user(row[0]) for row in self.db.execute("SELECT tg_id FROM users ORDER BY created DESC")]
+            users=[self.user(row[0], True) for row in self.db.execute("SELECT tg_id FROM users ORDER BY created DESC")]
+            for user in users: user["account_bound"] = bool(user.get("cookie") and user.get("uid"))
             deliveries=[dict(row) for row in self.db.execute("""SELECT d.*,r.name,u.name user_name,u.username
               FROM deliveries d JOIN resources r ON r.id=d.resource_id JOIN users u ON u.tg_id=d.tg_id ORDER BY d.created DESC LIMIT 300""")]
             resources=[dict(row) for row in self.db.execute("SELECT * FROM resources ORDER BY first_seen DESC LIMIT 200")]
@@ -514,6 +539,7 @@ class Application:
         self.store, self.stop = store, threading.Event()
         self.telegram = Telegram(self)
         self.scan_lock = threading.Lock()
+        self.cd2_snapshots = {}
 
     def mini_user(self, init_data):
         if not self.store.get("mini_enabled",True): raise PermissionError("小程序当前已停用")
@@ -542,7 +568,7 @@ class Application:
             stamp=now(); scanned=0; errors=[]
             for source in self.store.sources():
                 if not source["enabled"] or (not force and int(source["next_scan"] or 0)>stamp): continue
-                error=self.scan_source(cfg,source,stamp); scanned+=1
+                error=self.scan_source(cfg,source,stamp,force); scanned+=1
                 if error: errors.append(f"{source['name']}：{error}")
             if scanned:
                 self.store.set("last_scan", stamp)
@@ -555,9 +581,29 @@ class Application:
         except Exception as exc: self.store.set("last_error", f"扫描：{exc}")
         finally: self.scan_lock.release()
 
-    def scan_source(self,cfg,source,stamp):
+    def cd2_entries(self, source, force=False):
+        path = Path(source["cd2_path"])
+        entries = [item.name for item in os.scandir(path)]
+        snapshot = hashlib.sha256(dumps(sorted(entries)).encode()).hexdigest()
+        previous = self.cd2_snapshots.get(source["id"])
+        self.cd2_snapshots[source["id"]] = snapshot
+        return entries, force or previous is None or snapshot != previous
+
+    def scan_source(self,cfg,source,stamp,force=False):
         try:
-            entries=P115.list_dir(cfg["source_cookie"],source["cid"]); discovered=0
+            monitor_type = source.get("monitor_type") or "api_poll"
+            local_names = None
+            if monitor_type.startswith("cd2_"):
+                local, changed = self.cd2_entries(source, force)
+                if not changed:
+                    interval = 2 if monitor_type == "cd2_realtime" else int(source["poll_seconds"])
+                    with self.store.lock,self.store.db:
+                        self.store.db.execute("UPDATE sources SET last_scan=?,next_scan=?,error='',updated=? WHERE id=?",(stamp,stamp+interval,stamp,source["id"]))
+                    return ""
+                local_names = set(local)
+            entries=P115.list_dir(cfg["source_cookie"],source["cid"])
+            if local_names is not None: entries = [entry for entry in entries if entry["name"] in local_names]
+            discovered=0
             with self.store.lock,self.store.db:
                 baseline=bool(source["baseline_ready"])
                 for entry in entries:
@@ -573,12 +619,15 @@ class Application:
                         continue
                     discovered+=1; cat=category_for(entry["name"],cfg["default_category"])
                     status="historical" if not baseline else ("stabilizing" if int(source["stable_seconds"])>0 else "waiting")
-                    cleanup="retained" if int(source["retention_minutes"])<0 else "waiting"
-                    self.store.db.execute("""INSERT INTO resources(id,node_id,name,pickcode,sha1,size,is_dir,category,first_seen,status,source_id,cleanup)
-                      VALUES(?,?,?,?,?,?,?,?,?,?,?,?)""",(rid,entry["node_id"],entry["name"],entry["pickcode"],entry["sha1"],entry["size"],int(entry["is_dir"]),cat,stamp,status,source["id"],cleanup))
+                    age_delete=int(source.get("age_delete_minutes",-1))
+                    cleanup="scheduled" if age_delete>=0 else ("retained" if int(source["retention_minutes"])<0 else "waiting")
+                    delete_due=stamp+age_delete*60 if age_delete>=0 else 0
+                    self.store.db.execute("""INSERT INTO resources(id,node_id,name,pickcode,sha1,size,is_dir,category,first_seen,status,source_id,cleanup,delete_due)
+                      VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)""",(rid,entry["node_id"],entry["name"],entry["pickcode"],entry["sha1"],entry["size"],int(entry["is_dir"]),cat,stamp,status,source["id"],cleanup,delete_due))
                     if status=="waiting": self.queue_resource(rid,entry["name"],cat,stamp)
+                interval=2 if monitor_type=="cd2_realtime" else int(source["poll_seconds"])
                 self.store.db.execute("""UPDATE sources SET baseline_ready=1,historical=historical+?,added=added+?,last_scan=?,next_scan=?,error='',updated=? WHERE id=?""",
-                  (discovered if not baseline else 0,discovered if baseline else 0,stamp,stamp+int(source["poll_seconds"]),stamp,source["id"]))
+                  (discovered if not baseline else 0,discovered if baseline else 0,stamp,stamp+interval,stamp,source["id"]))
             self.store.event("来源",f"扫描 {source['name']}：发现 {discovered} 项",source["id"])
         except Exception as exc:
             with self.store.lock,self.store.db: self.store.db.execute("UPDATE sources SET error=?,last_scan=?,next_scan=?,updated=? WHERE id=?",(str(exc)[:500],stamp,stamp+int(source["poll_seconds"]),stamp,source["id"]))
@@ -627,10 +676,13 @@ class Application:
             done=now()
             with self.store.lock, self.store.db:
                 self.store.db.execute("UPDATE deliveries SET status='delivered',error='',next_attempt=0,source='source115',updated=? WHERE id=?", (done, item["id"]))
-                source=self.store.db.execute("SELECT retention_minutes FROM sources WHERE id=?",(item["source_id"],)).fetchone()
-                retention=int(source[0]) if source else -1
+                source=self.store.db.execute("SELECT retention_minutes,age_delete_minutes FROM sources WHERE id=?",(item["source_id"],)).fetchone()
+                retention=int(source[0]) if source else -1; age_delete=int(source[1]) if source else -1
                 due=done+retention*60 if retention>=0 else 0
-                self.store.db.execute("UPDATE resources SET first_success=CASE WHEN first_success=0 THEN ? ELSE first_success END,delete_due=CASE WHEN delete_due=0 THEN ? ELSE delete_due END,cleanup=CASE WHEN ? >= 0 THEN 'scheduled' ELSE 'retained' END WHERE id=?",(done,due,retention,item["resource_id"]))
+                self.store.db.execute("""UPDATE resources SET first_success=CASE WHEN first_success=0 THEN ? ELSE first_success END,
+                  delete_due=CASE WHEN delete_due=0 THEN ? ELSE delete_due END,
+                  cleanup=CASE WHEN ? >= 0 OR ? >= 0 THEN 'scheduled' ELSE 'retained' END WHERE id=?""",
+                  (done,due,age_delete,retention,item["resource_id"]))
             self.store.event("派送",f"派送成功：{item['name']}",item["id"])
             self.telegram.send(item["tg_id"], f"✅ <b>派送完成</b>\n{item['name']}", False)
         except Exception as exc:
@@ -641,7 +693,7 @@ class Application:
     def cleanup(self,cfg):
         stamp=now()
         with self.store.lock: rows=self.store.db.execute("""SELECT r.* FROM resources r JOIN sources s ON s.id=r.source_id
-          WHERE r.cleanup='scheduled' AND r.delete_due>0 AND r.delete_due<=? AND s.retention_minutes>=0
+          WHERE r.cleanup='scheduled' AND r.delete_due>0 AND r.delete_due<=? AND (s.retention_minutes>=0 OR s.age_delete_minutes>=0)
           AND NOT EXISTS(SELECT 1 FROM deliveries d WHERE d.resource_id=r.id AND d.status NOT IN ('delivered','cancelled')) LIMIT 20""",(stamp,)).fetchall()
         for row in rows:
             item=dict(row)
@@ -674,7 +726,7 @@ class Application:
             cfg = self.store.config(False)
             if cfg["enabled"]: self.scan(False)
             self.maintenance(cfg)
-            self.stop.wait(15)
+            self.stop.wait(2)
 
 
 class Handler(BaseHTTPRequestHandler):
@@ -689,12 +741,20 @@ class Handler(BaseHTTPRequestHandler):
         if length > 1024 * 1024: raise ValueError("请求过大")
         return json.loads(self.rfile.read(length) or b"{}")
     def admin(self):
-        if not hmac.compare_digest(self.headers.get("X-Admin-Key", ""), self.server.admin_key): raise PermissionError("管理密钥错误")
+        header = self.headers.get("Authorization", "")
+        if not header.startswith("Basic "): raise PermissionError("请先登录管理中心")
+        try:
+            username, password = base64.b64decode(header[6:]).decode("utf-8").split(":", 1)
+        except (ValueError, UnicodeDecodeError):
+            raise PermissionError("登录信息无效")
+        if not (hmac.compare_digest(username, self.server.admin_username) and hmac.compare_digest(password, self.server.admin_password)):
+            raise PermissionError("用户名或密码错误")
     def mini(self): return self.app.mini_user(self.headers.get("Authorization", "").removeprefix("tma "))
-    def do_OPTIONS(self): self.send_response(204); self.send_header("Access-Control-Allow-Origin", "*"); self.send_header("Access-Control-Allow-Headers", "content-type,authorization,x-admin-key"); self.send_header("Access-Control-Allow-Methods", "GET,POST,PUT,OPTIONS"); self.end_headers()
+    def do_OPTIONS(self): self.send_response(204); self.send_header("Access-Control-Allow-Origin", "*"); self.send_header("Access-Control-Allow-Headers", "content-type,authorization"); self.send_header("Access-Control-Allow-Methods", "GET,POST,PUT,DELETE,OPTIONS"); self.end_headers()
     def do_GET(self): self.route("GET")
     def do_POST(self): self.route("POST")
     def do_PUT(self): self.route("PUT")
+    def do_DELETE(self): self.route("DELETE")
     def route(self, method):
         try:
             path = urllib.parse.urlsplit(self.path).path
@@ -710,6 +770,8 @@ class Handler(BaseHTTPRequestHandler):
             if path == "/api/admin/config" and method == "PUT": self.admin(); self.app.store.save_config(self.body()); return self.send_json(200, {**self.app.store.status(), "message": "配置已保存"})
             if path == "/api/admin/users" and method == "PUT":
                 self.admin(); value=self.body(); user=self.app.store.save_user(int(value.get("tg_id") or 0),value); self.app.store.event("用户管理",f"更新用户：{user.get('name') or user.get('tg_id')}",str(user["tg_id"])); return self.send_json(200,{"message":"用户设置已保存","user":user})
+            if path == "/api/admin/users" and method == "DELETE":
+                self.admin(); value=self.body(); self.app.store.delete_user(int(value.get("tg_id") or 0)); return self.send_json(200,{"message":"用户已删除"})
             if path == "/api/admin/deliveries" and method == "POST": self.admin(); self.app.store.delivery_action(self.body()); return self.send_json(200,{"message":"派送任务已更新"})
             if path == "/api/admin/sources" and method == "PUT": self.admin(); sid=self.app.store.save_source(self.body()); return self.send_json(200,{"message":"监听目录已保存","id":sid})
             if path == "/api/admin/sources" and method == "POST": self.admin(); self.app.store.source_action(self.body()); return self.send_json(200,{"message":"监听目录操作完成"})
@@ -736,8 +798,8 @@ class Handler(BaseHTTPRequestHandler):
 
 def main():
     parser=argparse.ArgumentParser(); parser.add_argument("--host",default="127.0.0.1"); parser.add_argument("--port",type=int,default=8790); parser.add_argument("--data",default="/var/lib/cockroach-runner"); parser.add_argument("--static",default=str(Path(__file__).with_name("static"))); args=parser.parse_args()
-    admin_key=os.environ["COCKROACH_ADMIN_KEY"]; encryption_key=os.environ["COCKROACH_ENCRYPTION_KEY"]
-    app=Application(Store(args.data,encryption_key)); server=ThreadingHTTPServer((args.host,args.port),Handler); server.app=app; server.admin_key=admin_key; server.static_dir=args.static
+    admin_username=os.environ["COCKROACH_ADMIN_USERNAME"]; admin_password=os.environ["COCKROACH_ADMIN_PASSWORD"]; encryption_key=os.environ["COCKROACH_ENCRYPTION_KEY"]
+    app=Application(Store(args.data,encryption_key)); server=ThreadingHTTPServer((args.host,args.port),Handler); server.app=app; server.admin_username=admin_username; server.admin_password=admin_password; server.static_dir=args.static
     threading.Thread(target=app.telegram.loop,daemon=True).start(); threading.Thread(target=app.scheduler,daemon=True).start()
     try: server.serve_forever()
     finally: app.stop.set(); server.server_close()
