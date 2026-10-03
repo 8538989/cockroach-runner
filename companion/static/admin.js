@@ -8,6 +8,7 @@ const labels = {
   waiting: '等待', running: '进行中', retry: '待重试', delivered: '已完成', cancelled: '已取消',
   historical: '历史基线', deleted: '已删除', retained: '永久保留', scheduled: '等待删除',
   blocked: '删除失败', available: '可用', used: '已使用', revoked: '已撤销', expired: '已过期',
+  partial: '部分完成',
 }
 
 function escapeHtml(value) {
@@ -156,11 +157,19 @@ function renderBindings(items = []) {
 
 function renderResources(items = [], sources = []) {
   const sourceNames = Object.fromEntries(sources.map(source => [source.id, source.name]))
-  $('resourcesBody').innerHTML = items.length ? items.map(item => `<tr>
+  $('resourcesBody').innerHTML = items.length ? items.map(item => {
+    const total = Number(item.delivery_total || 0)
+    const done = Number(item.delivery_done || 0)
+    const active = Number(item.delivery_active || 0)
+    const failed = Number(item.delivery_failed || 0)
+    const deliveryState = active ? 'running' : total && done === total ? 'delivered' : total && failed === total ? 'cancelled' : total ? 'partial' : item.status
+    return `<tr>
     <td><strong>${escapeHtml(item.name)}</strong><small>${escapeHtml(item.category || '其他')}</small></td>
-    <td>${escapeHtml(sourceNames[item.source_id] || item.source_id || '—')}</td><td>${badge(item.status)}</td><td>${badge(item.cleanup)}</td>
+    <td>${escapeHtml(sourceNames[item.source_id] || item.source_id || '—')}</td><td>${badge(deliveryState)}<small>${done}/${total} 完成${active ? ` · ${active} 处理中` : ''}${failed ? ` · ${failed} 失败/取消` : ''}</small></td><td>${badge(item.cleanup)}</td>
     <td>${escapeHtml(item.delete_due ? formatTime(item.delete_due) : '—')}${item.cleanup_error ? `<small class="danger">${escapeHtml(item.cleanup_error)}</small>` : ''}</td>
-  </tr>`).join('') : emptyRow(5)
+    <td><button class="small-button danger-button" data-action="delete-resource" data-id="${escapeHtml(item.id)}">删除记录</button></td>
+  </tr>`
+  }).join('') : emptyRow(6)
 }
 
 function renderEvents(items = []) {
@@ -386,6 +395,13 @@ document.addEventListener('click', event => {
       await api('/api/admin/sources', 'POST', {id, action: 'delete'})
       await refresh(false)
     }, '监听目录已删除')
+  }
+  if (action === 'delete-resource') {
+    if (!confirm('确定删除这条秒传记录？这不会删除 115 文件，且会保留内部识别标记以防重复派送。')) return
+    return perform(async () => {
+      await api('/api/admin/resources', 'POST', {id, action: 'delete-record'})
+      await refresh(false)
+    }, '秒传记录已删除')
   }
 })
 

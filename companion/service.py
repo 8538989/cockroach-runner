@@ -77,6 +77,7 @@ class Store:
                 ("sources","monitor_type","TEXT NOT NULL DEFAULT 'api_poll'"),
                 ("sources","cd2_path","TEXT NOT NULL DEFAULT ''"),
                 ("sources","age_delete_minutes","INTEGER NOT NULL DEFAULT -1"),
+                ("resources","hidden","INTEGER NOT NULL DEFAULT 0"),
             ):
                 columns = {row[1] for row in self.db.execute(f"PRAGMA table_info({table})")}
                 if column not in columns: self.db.execute(f"ALTER TABLE {table} ADD COLUMN {column} {definition}")
@@ -263,6 +264,17 @@ class Store:
             else: raise ValueError("未知派送操作")
         self.event("派送", "手动重派" if action == "retry" else "取消派送", did)
 
+    def resource_action(self, value):
+        rid=str(value.get("id") or ""); action=str(value.get("action") or "")
+        if action != "delete-record": raise ValueError("未知秒传记录操作")
+        with self.lock,self.db:
+            row=self.db.execute("SELECT name FROM resources WHERE id=?",(rid,)).fetchone()
+            if not row: raise ValueError("秒传记录不存在")
+            active=self.db.execute("SELECT COUNT(*) FROM deliveries WHERE resource_id=? AND status IN ('waiting','running','retry')",(rid,)).fetchone()[0]
+            if active: raise ValueError("该资源仍有未完成派送，暂时不能删除记录")
+            self.db.execute("UPDATE resources SET hidden=1 WHERE id=?",(rid,))
+        self.event("秒传记录",f"删除记录：{row['name']}",rid)
+
     def overview(self):
         stamp=now()
         with self.lock, self.db:
@@ -271,7 +283,13 @@ class Store:
             for user in users: user["account_bound"] = bool(user.get("cookie") and user.get("uid"))
             deliveries=[dict(row) for row in self.db.execute("""SELECT d.*,r.name,u.name user_name,u.username
               FROM deliveries d JOIN resources r ON r.id=d.resource_id JOIN users u ON u.tg_id=d.tg_id ORDER BY d.created DESC LIMIT 300""")]
-            resources=[dict(row) for row in self.db.execute("SELECT * FROM resources ORDER BY first_seen DESC LIMIT 200")]
+            resources=[dict(row) for row in self.db.execute("""SELECT r.*,
+              COUNT(d.id) delivery_total,
+              SUM(CASE WHEN d.status='delivered' THEN 1 ELSE 0 END) delivery_done,
+              SUM(CASE WHEN d.status IN ('waiting','running','retry') THEN 1 ELSE 0 END) delivery_active,
+              SUM(CASE WHEN d.status IN ('cancelled','failed') THEN 1 ELSE 0 END) delivery_failed
+              FROM resources r LEFT JOIN deliveries d ON d.resource_id=r.id
+              WHERE r.hidden=0 GROUP BY r.id ORDER BY r.first_seen DESC LIMIT 200""")]
             bindings=[dict(row) for row in self.db.execute("SELECT id,code_hint,expires,status,used_by,created FROM bindings ORDER BY created DESC LIMIT 100")]
             events=[dict(row) for row in self.db.execute("SELECT * FROM events ORDER BY created DESC LIMIT 200")]
         return {**self.status(),"users_list":users,"deliveries":deliveries,"sources":self.sources(),"resources":resources,"bindings":bindings,"events":events}
@@ -388,6 +406,33 @@ class P115:
         name = str(user.get("user_name") or user.get("name") or "") if isinstance(user, dict) else ""
         if not uid: raise RuntimeError("115 Cookie 无效或已过期")
         return {"uid": uid, "name": name}
+
+    @staticmethod
+    def qr_start():
+        from p115client import P115Client
+        response=P115Client.login_qrcode_token("alipaymini")
+        data=response.get("data") if isinstance(response,dict) else None
+        if not isinstance(data,dict) or not data.get("uid"): raise RuntimeError((response or {}).get("message") or "生成115二维码失败")
+        image=P115Client.login_qrcode(str(data["uid"]),app="alipaymini")
+        return {"uid":str(data["uid"]),"time":data.get("time"),"sign":data.get("sign")}, bytes(image)
+
+    @staticmethod
+    def qr_poll(token):
+        from p115client import P115Client
+        response=P115Client.login_qrcode_scan_status(token)
+        data=response.get("data") if isinstance(response,dict) else None
+        if not isinstance(data,dict):
+            raise RuntimeError((response or {}).get("message") or (response or {}).get("error") or "查询扫码状态失败")
+        status=int(data.get("status",0))
+        if status == 0: return "waiting", ""
+        if status == 1: return "scanned", ""
+        if status != 2: return "expired", ""
+        result=P115Client.login_qrcode_scan_result(str(token["uid"]),app="alipaymini")
+        result_data=result.get("data") if isinstance(result,dict) else None
+        cookie=(result_data or {}).get("cookie") if isinstance(result_data,dict) else None
+        if isinstance(cookie,dict): cookie="; ".join(f"{key}={value}" for key,value in cookie.items() if value is not None)
+        if not isinstance(cookie,str) or not cookie.strip(): raise RuntimeError((result or {}).get("message") or "扫码成功但未取得115 Cookie")
+        return "confirmed", cookie.strip()
 
     @staticmethod
     def list_dir(cookie, cid):
@@ -540,6 +585,8 @@ class Application:
         self.telegram = Telegram(self)
         self.scan_lock = threading.Lock()
         self.cd2_snapshots = {}
+        self.qr_sessions = {}
+        self.qr_lock = threading.Lock()
 
     def mini_user(self, init_data):
         if not self.store.get("mini_enabled",True): raise PermissionError("小程序当前已停用")
@@ -559,6 +606,28 @@ class Application:
         if not current or current.get("status") != "active": raise PermissionError("请先在 Bot 中使用管理员提供的绑定码")
         self.store.upsert_user(tg_id, user.get("username", ""), " ".join(filter(None, [user.get("first_name"), user.get("last_name")])))
         return tg_id
+
+    def qr_start(self,tg_id):
+        token,image=P115.qr_start(); sid=secrets.token_urlsafe(24); expires=now()+300
+        with self.qr_lock:
+            self.qr_sessions={key:value for key,value in self.qr_sessions.items() if value["expires"]>now()}
+            self.qr_sessions[sid]={"tg_id":tg_id,"token":token,"expires":expires}
+        return {"session":sid,"expires":expires,"image":"data:image/png;base64,"+base64.b64encode(image).decode()}
+
+    def qr_poll(self,tg_id,value):
+        sid=str(value.get("session") or "")
+        with self.qr_lock: session=self.qr_sessions.get(sid)
+        if not session or session["tg_id"]!=tg_id: raise ValueError("二维码会话不存在")
+        if session["expires"]<=now():
+            with self.qr_lock: self.qr_sessions.pop(sid,None)
+            return {"status":"expired"}
+        status,cookie=P115.qr_poll(session["token"])
+        if status != "confirmed": return {"status":status,"expires":session["expires"]}
+        profile=P115.profile(cookie)
+        user=self.store.save_user(tg_id,{"cookie":cookie,"uid":profile["uid"],"target_cid":str(value.get("target_cid") or "0"),"target_name":str(value.get("target_name") or "根目录")})
+        with self.qr_lock: self.qr_sessions.pop(sid,None)
+        self.store.event("用户管理",f"扫码绑定115：{tg_id}",str(tg_id))
+        return {"status":"confirmed","user":user,"account":profile}
 
     def scan(self, force=True):
         if not self.scan_lock.acquire(False): return
@@ -769,6 +838,7 @@ class Handler(BaseHTTPRequestHandler):
             if path == "/admin.js": return self.send_file("admin.js", "text/javascript; charset=utf-8")
             if path == "/admin.css": return self.send_file("admin.css", "text/css; charset=utf-8")
             if path == "/style.css": return self.send_file("style.css", "text/css; charset=utf-8")
+            if path == "/qr.css": return self.send_file("qr.css", "text/css; charset=utf-8")
             if path == "/api/admin/status" and method == "GET": self.admin(); return self.send_json(200, self.app.store.status())
             if path == "/api/admin/overview" and method == "GET": self.admin(); return self.send_json(200, self.app.store.overview())
             if path == "/api/admin/config" and method == "PUT": self.admin(); self.app.store.save_config(self.body()); return self.send_json(200, {**self.app.store.status(), "message": "配置已保存"})
@@ -777,6 +847,7 @@ class Handler(BaseHTTPRequestHandler):
             if path == "/api/admin/users" and method == "DELETE":
                 self.admin(); value=self.body(); self.app.store.delete_user(int(value.get("tg_id") or 0)); return self.send_json(200,{"message":"用户已删除"})
             if path == "/api/admin/deliveries" and method == "POST": self.admin(); self.app.store.delivery_action(self.body()); return self.send_json(200,{"message":"派送任务已更新"})
+            if path == "/api/admin/resources" and method == "POST": self.admin(); self.app.store.resource_action(self.body()); return self.send_json(200,{"message":"秒传记录已删除"})
             if path == "/api/admin/sources" and method == "PUT": self.admin(); sid=self.app.store.save_source(self.body()); return self.send_json(200,{"message":"监听目录已保存","id":sid})
             if path == "/api/admin/sources" and method == "POST": self.admin(); self.app.store.source_action(self.body()); return self.send_json(200,{"message":"监听目录操作完成"})
             if path == "/api/admin/bindings" and method == "POST":
@@ -791,6 +862,8 @@ class Handler(BaseHTTPRequestHandler):
             if path == "/api/mini/account" and method == "PUT":
                 uid=self.mini(); value=self.body(); profile=P115.profile(str(value.get("cookie") or "")); value["uid"]=profile["uid"]
                 return self.send_json(200, {"user": self.app.store.save_user(uid, value), "account": profile})
+            if path == "/api/mini/qr/start" and method == "POST": uid=self.mini(); return self.send_json(200,self.app.qr_start(uid))
+            if path == "/api/mini/qr/status" and method == "POST": uid=self.mini(); return self.send_json(200,self.app.qr_poll(uid,self.body()))
             return self.send_json(404, {"error": "接口不存在"})
         except PermissionError as exc: self.send_json(401, {"error": str(exc)})
         except (ValueError, RuntimeError, urllib.error.URLError) as exc: self.send_json(400, {"error": str(exc)})

@@ -12,7 +12,9 @@ const state = {
   categories: [],
   overview: { deliveries: [], events: [], stats: { delivered: 0, pending: 0, failed: 0 } },
   saving: false,
+  qr: null,
 };
+let qrTimer = null;
 
 const pages = [["home", "首页"], ["rules", "接收"], ["records", "记录"], ["account", "我的"]];
 const modeLabels = { all: "全部接收", subscription: "按订阅关键词", category: "按分类", either: "订阅或分类" };
@@ -120,6 +122,48 @@ async function bindAccount() {
   }
 }
 
+async function startQrLogin() {
+  clearTimeout(qrTimer);
+  state.saving = true;
+  try {
+    const target = accountValues();
+    const data = await api("/api/mini/qr/start", "POST", {});
+    state.qr = { ...data, ...target, status: "waiting" };
+    render();
+    pollQrLogin();
+  } catch (error) {
+    toast(error.message);
+  } finally {
+    state.saving = false;
+    render();
+  }
+}
+
+async function pollQrLogin() {
+  if (!state.qr?.session) return;
+  try {
+    const data = await api("/api/mini/qr/status", "POST", {
+      session: state.qr.session,
+      target_cid: state.qr.target_cid,
+      target_name: state.qr.target_name,
+    });
+    if (data.status === "confirmed") {
+      state.profile = data.user;
+      state.qr = null;
+      render();
+      toast(`扫码绑定成功：${data.account?.name || data.account?.uid || "115账号"}`);
+      return;
+    }
+    state.qr.status = data.status;
+    render();
+    if (data.status !== "expired") qrTimer = setTimeout(pollQrLogin, 2000);
+  } catch (error) {
+    state.qr.status = "error";
+    state.qr.error = error.message;
+    render();
+  }
+}
+
 function shell(content) {
   const user = state.profile || {};
   return `<main class="member-shell">
@@ -206,6 +250,7 @@ function records() {
 
 function account() {
   const user = state.profile;
+  const qrLabels = { waiting: "等待扫码", scanned: "已扫码，请在 115 确认", expired: "二维码已过期", error: "查询失败" };
   return shell(`<section class="panel">
     <div class="identity">
       <div class="avatar">${esc(String(user.name || user.username || "蟑").slice(0, 1))}</div>
@@ -221,7 +266,15 @@ function account() {
     <label class="field"><span>115 Cookie</span><textarea id="cookie" rows="4" placeholder="UID=...; CID=...; SEID=...; KID=..."></textarea></label>
     <label class="field"><span>目标目录 CID</span><input id="cid" value="${esc(user.target_cid || "0")}"></label>
     <label class="field"><span>目标目录名称</span><input id="target" value="${esc(user.target_name || "根目录")}"></label>
-    <button class="primary full" data-bind ${state.saving ? "disabled" : ""}>${state.saving ? "正在验证..." : "验证并绑定 115"}</button>
+    <button class="primary full" data-qr-start ${state.saving ? "disabled" : ""}>${state.saving ? "正在生成..." : "扫码获取 CK"}</button>
+    ${state.qr ? `<div class="qr-card">
+      <img src="${state.qr.image}" alt="115 登录二维码">
+      <strong>${esc(qrLabels[state.qr.status] || state.qr.status)}</strong>
+      <small>${state.qr.error ? esc(state.qr.error) : "请使用 115 App 扫描，并在手机上确认登录。二维码约 5 分钟有效。"}</small>
+      ${["expired","error"].includes(state.qr.status) ? '<button class="text-button" data-qr-start>重新生成</button>' : ''}
+    </div>` : ''}
+    <div class="account-divider"><span>或者手动填写 CK</span></div>
+    <button class="secondary full" data-bind ${state.saving ? "disabled" : ""}>${state.saving ? "正在验证..." : "验证并绑定 CK"}</button>
   </section>`);
 }
 
@@ -247,6 +300,7 @@ function bind() {
   }));
   root.querySelector("[data-save]")?.addEventListener("click", savePreferences);
   root.querySelector("[data-bind]")?.addEventListener("click", bindAccount);
+  root.querySelectorAll("[data-qr-start]").forEach((node) => node.addEventListener("click", startQrLogin));
   root.querySelectorAll("[data-refresh]").forEach((node) => node.addEventListener("click", async () => {
     try {
       await load();

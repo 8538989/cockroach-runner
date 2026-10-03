@@ -37,7 +37,7 @@
         <button class="tab" data-tab="deliveriesPanel">派送任务</button>
         <button class="tab" data-tab="sourcesPanel">监听目录</button>
         <button class="tab" data-tab="bindingsPanel">绑定码</button>
-        <button class="tab" data-tab="cleanupPanel">秒传后删除</button>
+        <button class="tab" data-tab="cleanupPanel">秒传记录</button>
         <button class="tab" data-tab="settingsPanel">服务设置</button>
         <button class="tab" data-tab="eventsPanel">运行记录</button>
       </nav>
@@ -65,8 +65,8 @@
       </section>
 
       <section id="cleanupPanel" class="panel">
-        <div class="section-head"><div><h2>秒传后删除</h2><p>仅在目标文件校验成功，且所有派送完成或取消后，才执行源文件删除。</p></div><button class="refresh">刷新</button></div>
-        <div class="table-wrap"><table><thead><tr><th>资源</th><th>监听目录</th><th>派送状态</th><th>清理状态</th><th>计划时间 / 错误</th></tr></thead><tbody id="resourcesBody"></tbody></table></div>
+        <div class="section-head"><div><h2>秒传记录</h2><p>查看每个资源的实时派送汇总与源文件清理状态。删除记录不会删除 115 文件。</p></div><button class="refresh">刷新</button></div>
+        <div class="table-wrap"><table><thead><tr><th>资源</th><th>监听目录</th><th>派送状态</th><th>清理状态</th><th>计划时间 / 错误</th><th></th></tr></thead><tbody id="resourcesBody"></tbody></table></div>
       </section>
 
       <section id="settingsPanel" class="panel">

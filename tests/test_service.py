@@ -176,6 +176,42 @@ class ScanTests(unittest.TestCase):
                 service.P115.list_dir = original_list
                 store.db.close()
 
+    def test_resource_overview_aggregates_deliveries_and_hides_deleted_record(self):
+        with tempfile.TemporaryDirectory() as data_dir:
+            store = service.Store(data_dir, Fernet.generate_key().decode())
+            stamp = service.now()
+            with store.db:
+                store.db.execute("INSERT INTO resources(id,node_id,name,first_seen) VALUES('r','1','Record.mkv',?)", (stamp,))
+                store.db.execute("INSERT INTO users(tg_id,created,updated) VALUES(1,?,?)", (stamp, stamp))
+                store.db.execute("INSERT INTO users(tg_id,created,updated) VALUES(2,?,?)", (stamp, stamp))
+                store.db.execute("INSERT INTO deliveries(id,resource_id,tg_id,status,created,updated) VALUES('d1','r',1,'delivered',?,?)", (stamp, stamp))
+                store.db.execute("INSERT INTO deliveries(id,resource_id,tg_id,status,created,updated) VALUES('d2','r',2,'cancelled',?,?)", (stamp, stamp))
+            record = next(item for item in store.overview()["resources"] if item["id"] == "r")
+            self.assertEqual((record["delivery_total"], record["delivery_done"], record["delivery_failed"]), (2, 1, 1))
+            store.resource_action({"id": "r", "action": "delete-record"})
+            self.assertFalse(any(item["id"] == "r" for item in store.overview()["resources"]))
+            self.assertEqual(store.db.execute("SELECT hidden FROM resources WHERE id='r'").fetchone()[0], 1)
+            store.db.close()
+
+    def test_qr_confirmation_binds_cookie_to_current_user(self):
+        with tempfile.TemporaryDirectory() as data_dir:
+            store = service.Store(data_dir, Fernet.generate_key().decode())
+            store.upsert_user(123)
+            app = service.Application(store)
+            original_start, original_poll, original_profile = service.P115.qr_start, service.P115.qr_poll, service.P115.profile
+            try:
+                service.P115.qr_start = staticmethod(lambda: ({"uid": "qr", "time": 1, "sign": "s"}, b"png"))
+                service.P115.qr_poll = staticmethod(lambda _token: ("confirmed", "UID=1; CID=2; SEID=3"))
+                service.P115.profile = staticmethod(lambda _cookie: {"uid": "1", "name": "QR User"})
+                started = app.qr_start(123)
+                result = app.qr_poll(123, {"session": started["session"], "target_cid": "9", "target_name": "扫码目录"})
+                self.assertEqual(result["status"], "confirmed")
+                user = store.user(123, True)
+                self.assertEqual((user["uid"], user["cookie"], user["target_cid"]), ("1", "UID=1; CID=2; SEID=3", "9"))
+            finally:
+                service.P115.qr_start, service.P115.qr_poll, service.P115.profile = original_start, original_poll, original_profile
+                store.db.close()
+
 
 if __name__ == "__main__":
     unittest.main()
