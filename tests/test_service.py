@@ -51,6 +51,20 @@ class ScanTests(unittest.TestCase):
             self.assertEqual((row["status"], row["used_by"]), ("used", "123"))
             store.db.close()
 
+    def test_mini_overview_is_scoped_to_current_user(self):
+        with tempfile.TemporaryDirectory() as data_dir:
+            store = service.Store(data_dir, Fernet.generate_key().decode())
+            stamp = service.now()
+            with store.db:
+                store.db.execute("INSERT INTO resources(id,node_id,name,pickcode,sha1,size,is_dir,category,first_seen,status,source_id) VALUES('r1','1','Mine.mkv','p','a',1,0,'电影',?,'waiting','legacy')", (stamp,))
+                store.db.execute("INSERT INTO resources(id,node_id,name,pickcode,sha1,size,is_dir,category,first_seen,status,source_id) VALUES('r2','2','Other.mkv','p','b',1,0,'电影',?,'waiting','legacy')", (stamp,))
+                store.db.execute("INSERT INTO deliveries(id,resource_id,tg_id,status,created,updated) VALUES('d1','r1',123,'delivered',?,?)", (stamp, stamp))
+                store.db.execute("INSERT INTO deliveries(id,resource_id,tg_id,status,created,updated) VALUES('d2','r2',456,'waiting',?,?)", (stamp, stamp))
+            overview = store.mini_overview(123)
+            self.assertEqual([item["name"] for item in overview["deliveries"]], ["Mine.mkv"])
+            self.assertEqual(overview["stats"], {"delivered": 1, "pending": 0, "failed": 0})
+            store.db.close()
+
     def test_success_schedules_cleanup_only_when_source_rule_enabled(self):
         with tempfile.TemporaryDirectory() as data_dir:
             store = service.Store(data_dir, Fernet.generate_key().decode())

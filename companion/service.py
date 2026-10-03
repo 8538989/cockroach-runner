@@ -251,6 +251,21 @@ class Store:
             events=[dict(row) for row in self.db.execute("SELECT * FROM events ORDER BY created DESC LIMIT 200")]
         return {**self.status(),"users_list":users,"deliveries":deliveries,"sources":self.sources(),"resources":resources,"bindings":bindings,"events":events}
 
+    def mini_overview(self, tg_id):
+        with self.lock:
+            deliveries=[dict(row) for row in self.db.execute("""SELECT d.*,r.name,r.category,r.size,r.cleanup,r.cleanup_error
+              FROM deliveries d JOIN resources r ON r.id=d.resource_id WHERE d.tg_id=?
+              ORDER BY d.created DESC LIMIT 50""",(tg_id,))]
+            events=[dict(row) for row in self.db.execute("""SELECT * FROM events
+              WHERE object_id IN (SELECT id FROM deliveries WHERE tg_id=?) OR message LIKE ?
+              ORDER BY created DESC LIMIT 50""",(tg_id,f"%{tg_id}%"))]
+            stats=dict(self.db.execute("""SELECT
+              SUM(CASE WHEN status='delivered' THEN 1 ELSE 0 END) delivered,
+              SUM(CASE WHEN status IN ('waiting','running','retry') THEN 1 ELSE 0 END) pending,
+              SUM(CASE WHEN status IN ('failed','cancelled') THEN 1 ELSE 0 END) failed
+              FROM deliveries WHERE tg_id=?""",(tg_id,)).fetchone())
+        return {"deliveries":deliveries,"events":events,"stats":{k:int(v or 0) for k,v in stats.items()}}
+
     def status(self):
         with self.lock:
             users = self.db.execute("SELECT COUNT(*) FROM users").fetchone()[0]
@@ -705,6 +720,7 @@ class Handler(BaseHTTPRequestHandler):
             if path == "/api/admin/test-bot" and method == "POST": self.admin(); info=self.app.telegram.call("getMe"); return self.send_json(200, {**self.app.store.status(), "message": f"Bot 连接正常：@{info.get('username','')}"})
             if path == "/api/admin/scan" and method == "POST": self.admin(); threading.Thread(target=self.app.scan,daemon=True).start(); return self.send_json(202, {**self.app.store.status(), "message": "扫描已启动"})
             if path == "/api/mini/me" and method == "GET": uid=self.mini(); return self.send_json(200, {"user": self.app.store.user(uid), "categories": ["电影","剧集","动漫","纪录片","其他"]})
+            if path == "/api/mini/overview" and method == "GET": uid=self.mini(); return self.send_json(200, self.app.store.mini_overview(uid))
             if path == "/api/mini/preferences" and method == "PUT": uid=self.mini(); return self.send_json(200, {"user": self.app.store.save_user(uid, self.body())})
             if path == "/api/mini/account" and method == "PUT":
                 uid=self.mini(); value=self.body(); profile=P115.profile(str(value.get("cookie") or "")); value["uid"]=profile["uid"]
