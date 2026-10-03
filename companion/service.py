@@ -287,6 +287,8 @@ class Telegram:
                     self.app.stop.wait(5)
                     continue
                 updates = self.call("getUpdates", {"offset": self.offset, "timeout": 25, "allowed_updates": dumps(["message"])}, 35)
+                if str(self.app.store.get("last_error", "")).startswith("Bot:"):
+                    self.app.store.set("last_error", "")
                 for update in updates or []:
                     self.offset = max(self.offset, int(update["update_id"]) + 1)
                     self.handle(update.get("message") or {})
