@@ -10,6 +10,77 @@ import service  # noqa: E402
 
 
 class ScanTests(unittest.TestCase):
+    def test_store_recovers_running_delivery_after_restart(self):
+        with tempfile.TemporaryDirectory() as data_dir:
+            key = Fernet.generate_key().decode()
+            store = service.Store(data_dir, key)
+            stamp = service.now()
+            with store.db:
+                store.db.execute("INSERT INTO resources(id,node_id,name,first_seen) VALUES('r','1','Stuck.mkv',?)", (stamp,))
+                store.db.execute("INSERT INTO users(tg_id,created,updated) VALUES(123,?,?)", (stamp, stamp))
+                store.db.execute("INSERT INTO deliveries(id,resource_id,tg_id,status,created,updated) VALUES('d','r',123,'running',?,?)", (stamp, stamp))
+            store.db.close()
+
+            reopened = service.Store(data_dir, key)
+            row = reopened.db.execute("SELECT status,next_attempt,error FROM deliveries WHERE id='d'").fetchone()
+            self.assertEqual((row["status"], row["next_attempt"]), ("retry", 0))
+            self.assertIn("服务重启", row["error"])
+            reopened.db.close()
+
+    def test_nested_directories_expand_to_individual_video_resources(self):
+        with tempfile.TemporaryDirectory() as data_dir:
+            store = service.Store(data_dir, Fernet.generate_key().decode())
+            store.set("source_cookie", "source", True)
+            store.set("p115_api_interval_seconds", 0)
+            store.upsert_user(123)
+            store.save_user(123, {"cookie": "target", "uid": "u1"})
+            with store.db:
+                store.db.execute("UPDATE sources SET baseline_ready=1,stable_seconds=0 WHERE id='legacy'")
+            tree = {
+                "0": [{"node_id": "dir1", "name": "Show", "is_dir": True, "pickcode": "", "sha1": "", "size": 0}],
+                "dir1": [
+                    {"node_id": "v1", "name": "Show.S01E01.mkv", "is_dir": False, "pickcode": "p1", "sha1": "a", "size": 10},
+                    {"node_id": "sub", "name": "Season 2", "is_dir": True, "pickcode": "", "sha1": "", "size": 0},
+                    {"node_id": "txt", "name": "readme.txt", "is_dir": False, "pickcode": "p3", "sha1": "c", "size": 1},
+                ],
+                "sub": [{"node_id": "v2", "name": "Show.S02E01.mp4", "is_dir": False, "pickcode": "p2", "sha1": "b", "size": 20}],
+            }
+            original_list = service.P115.list_dir
+            try:
+                service.P115.list_dir = staticmethod(lambda _cookie, cid: tree[str(cid)])
+                app = service.Application(store)
+                app.scan_source(store.config(True), store.sources()[0], service.now(), True)
+                rows = store.db.execute("SELECT name,is_dir FROM resources ORDER BY name").fetchall()
+                self.assertEqual([(row["name"], row["is_dir"]) for row in rows], [
+                    ("Show.S01E01.mkv", 0), ("Show.S02E01.mp4", 0)
+                ])
+                self.assertEqual(store.db.execute("SELECT COUNT(*) FROM deliveries").fetchone()[0], 2)
+            finally:
+                service.P115.list_dir = original_list
+                store.db.close()
+
+    def test_cd2_mount_snapshot_detects_nested_file_change(self):
+        with tempfile.TemporaryDirectory() as data_dir:
+            store = service.Store(data_dir, Fernet.generate_key().decode())
+            store.set("cd2_api_interval_seconds", 0)
+            store.set("cd2_root", data_dir)
+            watched = Path(data_dir) / "watched"
+            nested = watched / "Show"
+            nested.mkdir(parents=True)
+            video = nested / "Episode.mkv"
+            video.write_bytes(b"one")
+            source = store.sources()[0]
+            source.update({"monitor_type": "cd2_realtime", "cd2_path": str(watched)})
+            app = service.Application(store)
+            _names, first_changed = app.cd2_entries(store.config(True), source)
+            _names, unchanged = app.cd2_entries(store.config(True), source)
+            video.write_bytes(b"changed")
+            _names, nested_changed = app.cd2_entries(store.config(True), source)
+            self.assertTrue(first_changed)
+            self.assertFalse(unchanged)
+            self.assertTrue(nested_changed)
+            store.db.close()
+
     def test_first_scan_is_baseline_and_second_scan_dispatches(self):
         with tempfile.TemporaryDirectory() as data_dir:
             store = service.Store(data_dir, Fernet.generate_key().decode())

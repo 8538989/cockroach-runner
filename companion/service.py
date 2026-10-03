@@ -113,6 +113,9 @@ class Store:
                 if column not in columns: self.db.execute(f"ALTER TABLE {table} ADD COLUMN {column} {definition}")
         self.ensure_legacy_source()
         with self.lock, self.db:
+            stamp = now()
+            self.db.execute("""UPDATE deliveries SET status='retry',next_attempt=0,updated=?,
+              error=CASE WHEN error='' THEN '服务重启后自动恢复未完成任务' ELSE error END WHERE status='running'""", (stamp,))
             self.db.execute("""UPDATE resources SET cleanup='retained'
               WHERE cleanup='waiting' AND source_id IN (SELECT id FROM sources WHERE retention_minutes<0)""")
 
@@ -516,14 +519,10 @@ class P115:
     @staticmethod
     def transfer(source_cookie, user_cookie, entry, target_cid):
         from p115client import P115Client
-        from p115client.tool.upload import iter_115_to_115
+        if entry["is_dir"]:
+            raise RuntimeError("目录资源必须先展开为视频文件，不能作为一个整体派送")
         source = P115Client(P115.cookie_mapping(source_cookie))
         target = P115Client(P115.cookie_mapping(user_cookie))
-        if entry["is_dir"]:
-            results = list(iter_115_to_115(source, target, from_cid=entry["node_id"], to_pid=target_cid, with_root=True, max_workers=2))
-            failed = [x for x in results if isinstance(x, dict) and x.get("type") == "fail"]
-            if failed: raise RuntimeError(f"115转存部分失败：{len(failed)} 项")
-            return
 
         def target_entries():
             return P115.list_dir(user_cookie, target_cid)
@@ -818,11 +817,51 @@ class Application:
     def cd2_entries(self, cfg, source, force=False):
         mode = "api" if source.get("monitor_type") == "cd2_api" else "mount"
         self.cd2_gate.wait(cfg.get("cd2_api_interval_seconds", 1))
-        entries = [item["name"] for item in CD2.list_dir(cfg, source["cd2_path"], mode)]
-        snapshot = hashlib.sha256(dumps(sorted(entries)).encode()).hexdigest()
+        root_items = CD2.list_dir(cfg, source["cd2_path"], mode)
+        entries = [item["name"] for item in root_items]
+        signatures = []
+        if mode == "mount":
+            root = Path(source["cd2_path"])
+            for current, dirs, files in os.walk(root):
+                relative = str(Path(current).relative_to(root))
+                signatures.extend(f"d:{relative}/{name}" for name in dirs)
+                for name in files:
+                    path = Path(current) / name
+                    try:
+                        stat = path.stat(); signatures.append(f"f:{relative}/{name}:{stat.st_size}:{stat.st_mtime_ns}")
+                    except OSError:
+                        signatures.append(f"f:{relative}/{name}")
+        else:
+            queue = [item["path"] for item in root_items if item["is_dir"]]
+            signatures.extend(("d:" if item["is_dir"] else "f:") + item["path"] for item in root_items)
+            visited = 0
+            while queue and visited < 1000:
+                path = queue.pop(0); visited += 1
+                self.cd2_gate.wait(cfg.get("cd2_api_interval_seconds", 1))
+                children = CD2.list_dir(cfg, path, mode)
+                for item in children:
+                    signatures.append(("d:" if item["is_dir"] else "f:") + item["path"])
+                    if item["is_dir"]: queue.append(item["path"])
+            if queue: raise RuntimeError("CD2 目录层级项目超过 1000，已停止递归以避免过量请求")
+        snapshot = hashlib.sha256(dumps(sorted(signatures)).encode()).hexdigest()
         previous = self.cd2_snapshots.get(source["id"])
         self.cd2_snapshots[source["id"]] = snapshot
         return entries, force or previous is None or snapshot != previous
+
+    def expand_source_videos(self, cfg, entries):
+        videos = []
+        queue = list(entries)
+        visited_dirs = 0
+        while queue:
+            entry = queue.pop(0)
+            if not entry["is_dir"]:
+                if Path(entry["name"]).suffix.lower() in VIDEO_EXTENSIONS: videos.append(entry)
+                continue
+            visited_dirs += 1
+            if visited_dirs > 1000: raise RuntimeError("115 子目录数量超过 1000，已停止递归以避免 API 风控")
+            self.p115_gate.wait(cfg.get("p115_api_interval_seconds", 1))
+            queue.extend(P115.list_dir(cfg["source_cookie"], entry["node_id"]))
+        return videos
 
     def scan_source(self,cfg,source,stamp,force=False):
         try:
@@ -843,11 +882,11 @@ class Application:
             self.p115_gate.wait(cfg.get("p115_api_interval_seconds", 1))
             entries=P115.list_dir(cfg["source_cookie"],source["cid"])
             if local_names is not None: entries = [entry for entry in entries if entry["name"] in local_names]
+            entries=self.expand_source_videos(cfg,entries)
             discovered=0
             with self.store.lock,self.store.db:
                 baseline=bool(source["baseline_ready"])
                 for entry in entries:
-                    if not entry["is_dir"] and Path(entry["name"]).suffix.lower() not in VIDEO_EXTENSIONS: continue
                     identity=entry["node_id"]+":"+entry["name"]+":"+str(entry["size"])
                     # Preserve IDs created by versions before multi-source support,
                     # otherwise an upgrade would enqueue every existing file again.
