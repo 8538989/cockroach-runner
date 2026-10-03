@@ -320,21 +320,56 @@ class Store:
     def delivery_action(self, value):
         did=str(value.get("id") or ""); action=str(value.get("action") or ""); stamp=now()
         with self.lock, self.db:
-            if action == "retry": self.db.execute("UPDATE deliveries SET status='retry',error='',next_attempt=0,updated=? WHERE id=? AND status NOT IN ('running','delivered')",(stamp,did))
-            elif action == "cancel": self.db.execute("UPDATE deliveries SET status='cancelled',updated=? WHERE id=? AND status NOT IN ('running','delivered')",(stamp,did))
+            if action == "retry": changed=self.db.execute("UPDATE deliveries SET status='retry',error='',next_attempt=0,updated=? WHERE id=? AND status NOT IN ('running','delivered')",(stamp,did)).rowcount
+            elif action == "cancel": changed=self.db.execute("UPDATE deliveries SET status='cancelled',error='管理员已取消派送',next_attempt=0,updated=? WHERE id=? AND status NOT IN ('delivered','cancelled')",(stamp,did)).rowcount
+            elif action == "retry-all": changed=self.db.execute("UPDATE deliveries SET status='retry',error='',next_attempt=0,updated=? WHERE status IN ('waiting','retry','cancelled','failed')",(stamp,)).rowcount
+            elif action == "cancel-all": changed=self.db.execute("UPDATE deliveries SET status='cancelled',error='管理员已取消全部派送',next_attempt=0,updated=? WHERE status IN ('waiting','retry','running')",(stamp,)).rowcount
+            elif action == "delete-all": changed=self.db.execute("DELETE FROM deliveries").rowcount
             else: raise ValueError("未知派送操作")
-        self.event("派送", "手动重派" if action == "retry" else "取消派送", did)
+        descriptions={"retry":"手动重派","cancel":"取消派送","retry-all":"全部重新派送","cancel-all":"取消全部派送","delete-all":"删除全部派送任务记录"}
+        self.event("派送",f"{descriptions[action]}：{changed} 条",did)
+        return changed
 
     def resource_action(self, value):
         rid=str(value.get("id") or ""); action=str(value.get("action") or "")
-        if action != "delete-record": raise ValueError("未知秒传记录操作")
+        if action not in ("delete-record","delete-all-records"): raise ValueError("未知秒传记录操作")
         with self.lock,self.db:
+            if action == "delete-all-records":
+                active=self.db.execute("""SELECT COUNT(*) FROM deliveries d JOIN resources r ON r.id=d.resource_id
+                  WHERE r.hidden=0 AND d.status IN ('waiting','running','retry')""").fetchone()[0]
+                if active: raise ValueError("仍有未完成派送，请先点击“全部取消”再删除全部秒传记录")
+                changed=self.db.execute("UPDATE resources SET hidden=1 WHERE hidden=0").rowcount
+                self.event("秒传记录",f"删除全部记录：{changed} 条")
+                return changed
             row=self.db.execute("SELECT name FROM resources WHERE id=?",(rid,)).fetchone()
             if not row: raise ValueError("秒传记录不存在")
             active=self.db.execute("SELECT COUNT(*) FROM deliveries WHERE resource_id=? AND status IN ('waiting','running','retry')",(rid,)).fetchone()[0]
             if active: raise ValueError("该资源仍有未完成派送，暂时不能删除记录")
             self.db.execute("UPDATE resources SET hidden=1 WHERE id=?",(rid,))
         self.event("秒传记录",f"删除记录：{row['name']}",rid)
+        return 1
+
+    def records_page(self, kind, page=1, page_size=100):
+        page=max(1,int(page or 1)); page_size=max(1,min(100,int(page_size or 100))); offset=(page-1)*page_size
+        with self.lock:
+            if kind == "deliveries":
+                total=self.db.execute("SELECT COUNT(*) FROM deliveries").fetchone()[0]
+                items=[dict(row) for row in self.db.execute("""SELECT d.*,r.name,u.name user_name,u.username
+                  FROM deliveries d JOIN resources r ON r.id=d.resource_id JOIN users u ON u.tg_id=d.tg_id
+                  ORDER BY d.created DESC,d.id LIMIT ? OFFSET ?""",(page_size,offset))]
+            elif kind == "resources":
+                total=self.db.execute("SELECT COUNT(*) FROM resources WHERE hidden=0").fetchone()[0]
+                items=[dict(row) for row in self.db.execute("""SELECT r.*,
+                  COUNT(d.id) delivery_total,
+                  SUM(CASE WHEN d.status='delivered' THEN 1 ELSE 0 END) delivery_done,
+                  SUM(CASE WHEN d.status IN ('waiting','running','retry') THEN 1 ELSE 0 END) delivery_active,
+                  SUM(CASE WHEN d.status IN ('cancelled','failed') THEN 1 ELSE 0 END) delivery_failed
+                  FROM resources r LEFT JOIN deliveries d ON d.resource_id=r.id
+                  WHERE r.hidden=0 GROUP BY r.id ORDER BY r.first_seen DESC,r.id LIMIT ? OFFSET ?""",(page_size,offset))]
+            else: raise ValueError("未知记录类型")
+        pages=max(1,(total+page_size-1)//page_size)
+        if page>pages: return self.records_page(kind,pages,page_size)
+        return {"items":items,"page":page,"page_size":page_size,"total":total,"pages":pages}
 
     def overview(self):
         stamp=now()
@@ -342,15 +377,8 @@ class Store:
             self.db.execute("UPDATE bindings SET status='expired' WHERE status='available' AND expires<?",(stamp,))
             users=[self.user(row[0], True) for row in self.db.execute("SELECT tg_id FROM users ORDER BY created DESC")]
             for user in users: user["account_bound"] = bool(user.get("cookie") and user.get("uid"))
-            deliveries=[dict(row) for row in self.db.execute("""SELECT d.*,r.name,u.name user_name,u.username
-              FROM deliveries d JOIN resources r ON r.id=d.resource_id JOIN users u ON u.tg_id=d.tg_id ORDER BY d.created DESC LIMIT 300""")]
-            resources=[dict(row) for row in self.db.execute("""SELECT r.*,
-              COUNT(d.id) delivery_total,
-              SUM(CASE WHEN d.status='delivered' THEN 1 ELSE 0 END) delivery_done,
-              SUM(CASE WHEN d.status IN ('waiting','running','retry') THEN 1 ELSE 0 END) delivery_active,
-              SUM(CASE WHEN d.status IN ('cancelled','failed') THEN 1 ELSE 0 END) delivery_failed
-              FROM resources r LEFT JOIN deliveries d ON d.resource_id=r.id
-              WHERE r.hidden=0 GROUP BY r.id ORDER BY r.first_seen DESC LIMIT 200""")]
+            deliveries=[]
+            resources=[]
             bindings=[dict(row) for row in self.db.execute("SELECT id,code_hint,expires,status,used_by,created,plan,grant_days FROM bindings ORDER BY created DESC LIMIT 100")]
             events=[dict(row) for row in self.db.execute("SELECT * FROM events ORDER BY created DESC LIMIT 200")]
         return {**self.status(),"users_list":users,"deliveries":deliveries,"sources":self.sources(),"resources":resources,"bindings":bindings,"events":events}
@@ -951,10 +979,14 @@ class Application:
         try:
             self.transfer_gate.wait(cfg.get("transfer_interval_seconds", 3))
             cookie = self.store.crypt.decrypt(item["cookie"].encode()).decode()
-            with self.store.lock, self.store.db: self.store.db.execute("UPDATE deliveries SET status='running',attempts=attempts+1,updated=? WHERE id=?", (now(), item["id"]))
+            with self.store.lock, self.store.db:
+                started=self.store.db.execute("UPDATE deliveries SET status='running',attempts=attempts+1,updated=? WHERE id=? AND status IN ('waiting','retry')", (now(), item["id"])).rowcount
+            if not started: return
             P115.transfer(cfg["source_cookie"], cookie, item, item["target_cid"])
             done=now()
             with self.store.lock, self.store.db:
+                current=self.store.db.execute("SELECT status FROM deliveries WHERE id=?",(item["id"],)).fetchone()
+                if not current or current["status"] != "running": return
                 self.store.db.execute("UPDATE deliveries SET status='delivered',error='',next_attempt=0,source='source115',updated=? WHERE id=?", (done, item["id"]))
                 source=self.store.db.execute("SELECT retention_minutes,age_delete_minutes FROM sources WHERE id=?",(item["source_id"],)).fetchone()
                 retention=int(source[0]) if source else -1; age_delete=int(source[1]) if source else -1
@@ -967,7 +999,7 @@ class Application:
             self.telegram.send(item["tg_id"], f"✅ <b>派送完成</b>\n{item['name']}", False)
         except Exception as exc:
             failed=now(); delay=max(1,int(cfg.get("retry_minutes") or 15))*60
-            with self.store.lock, self.store.db: self.store.db.execute("UPDATE deliveries SET status='retry',error=?,next_attempt=?,updated=? WHERE id=?", (str(exc)[:500],failed+delay,failed,item["id"]))
+            with self.store.lock, self.store.db: self.store.db.execute("UPDATE deliveries SET status='retry',error=?,next_attempt=?,updated=? WHERE id=? AND status='running'", (str(exc)[:500],failed+delay,failed,item["id"]))
             self.store.event("派送失败",f"{item['name']}：{exc}",item["id"])
 
     def cleanup(self,cfg):
@@ -1050,6 +1082,8 @@ class Handler(BaseHTTPRequestHandler):
             if path == "/brand-icon.mp4": return self.send_file("brand-icon.mp4", "video/mp4")
             if path == "/api/admin/status" and method == "GET": self.admin(); return self.send_json(200, self.app.store.status())
             if path == "/api/admin/overview" and method == "GET": self.admin(); return self.send_json(200, self.app.store.overview())
+            if path == "/api/admin/records" and method == "GET":
+                self.admin(); return self.send_json(200,self.app.store.records_page(str(query.get("type",[""])[0]),query.get("page",[1])[0],query.get("page_size",[100])[0]))
             if path == "/api/admin/config" and method == "PUT": self.admin(); self.app.store.save_config(self.body()); return self.send_json(200, {**self.app.store.status(), "message": "配置已保存"})
             if path == "/api/admin/browse" and method == "GET": self.admin(); return self.send_json(200, self.app.admin_browse(query))
             if path == "/api/admin/test-cd2" and method == "POST": self.admin(); result=CD2.test(self.app.store.config(True)); return self.send_json(200,{"message":f"CD2 连接正常，读取到 {result['count']} 个项目",**result})

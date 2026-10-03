@@ -3,6 +3,8 @@ const dashboard = $('dashboard')
 let overview = null
 let toastTimer
 let folderPicker = null
+const recordPages = {deliveries: 1, resources: 1}
+const recordPageCounts = {deliveries: 1, resources: 1}
 
 const labels = {
   active: '正常', disabled: '停用', valid: '有效', invalid: '失效', missing: '未绑定',
@@ -192,6 +194,22 @@ function renderResources(items = [], sources = []) {
   }).join('') : emptyRow(6)
 }
 
+function renderPager(kind, result) {
+  recordPages[kind] = Number(result.page || 1)
+  recordPageCounts[kind] = Number(result.pages || 1)
+  const prefix = kind === 'deliveries' ? 'deliveries' : 'resources'
+  $(`${prefix}PageInfo`).textContent = `第 ${recordPages[kind]} / ${recordPageCounts[kind]} 页 · 共 ${Number(result.total || 0)} 条`
+  $(`${prefix}Prev`).disabled = recordPages[kind] <= 1
+  $(`${prefix}Next`).disabled = recordPages[kind] >= recordPageCounts[kind]
+}
+
+async function loadRecords(kind, page = recordPages[kind]) {
+  const result = await api(`/api/admin/records?type=${encodeURIComponent(kind)}&page=${Number(page)}&page_size=100`)
+  if (kind === 'deliveries') renderDeliveries(result.items || [])
+  else renderResources(result.items || [], overview?.sources || [])
+  renderPager(kind, result)
+}
+
 function renderEvents(items = []) {
   $('eventsBody').innerHTML = items.length ? items.map(item => `<tr><td>${escapeHtml(formatTime(item.created))}</td><td>${escapeHtml(item.kind)}</td><td>${escapeHtml(item.message)}</td><td><code>${escapeHtml(item.object_id || '—')}</code></td></tr>`).join('') : emptyRow(4)
 }
@@ -211,6 +229,7 @@ function render(data) {
 
 async function refresh(showMessage = true) {
   render(await api('/api/admin/overview'))
+  await Promise.all([loadRecords('deliveries'), loadRecords('resources')])
   $('loginCard').hidden = true
   $('dashboard').hidden = false
   if (showMessage) message('数据已刷新')
@@ -499,6 +518,45 @@ document.addEventListener('click', event => {
       await refresh(false)
     }, '秒传记录已删除')
   }
+})
+
+$('deliveriesPrev').addEventListener('click', () => perform(() => loadRecords('deliveries', recordPages.deliveries - 1)))
+$('deliveriesNext').addEventListener('click', () => perform(() => loadRecords('deliveries', recordPages.deliveries + 1)))
+$('resourcesPrev').addEventListener('click', () => perform(() => loadRecords('resources', recordPages.resources - 1)))
+$('resourcesNext').addEventListener('click', () => perform(() => loadRecords('resources', recordPages.resources + 1)))
+
+$('cancelAllDeliveries').addEventListener('click', () => {
+  if (!confirm('确定取消所有等待、重试和派送中的任务吗？已完成的任务不会改变。')) return
+  return perform(async () => {
+    await api('/api/admin/deliveries', 'POST', {action: 'cancel-all'})
+    await refresh(false)
+  }, '所有未完成派送已取消')
+})
+
+$('retryAllDeliveries').addEventListener('click', () => {
+  if (!confirm('确定把所有未完成、失败和已取消的任务加入重试队列吗？已完成任务不会重复派送。')) return
+  return perform(async () => {
+    await api('/api/admin/deliveries', 'POST', {action: 'retry-all'})
+    await refresh(false)
+  }, '所有可重试任务已加入队列')
+})
+
+$('deleteAllDeliveries').addEventListener('click', () => {
+  if (!confirm('确定永久删除所有派送任务记录吗？此操作不会删除 115 文件，但无法撤销。')) return
+  return perform(async () => {
+    await api('/api/admin/deliveries', 'POST', {action: 'delete-all'})
+    recordPages.deliveries = 1
+    await refresh(false)
+  }, '所有派送任务记录已删除')
+})
+
+$('deleteAllResources').addEventListener('click', () => {
+  if (!confirm('确定一键删除所有秒传记录吗？此操作不会删除 115 文件，也不会清空监控文件夹。')) return
+  return perform(async () => {
+    await api('/api/admin/resources', 'POST', {action: 'delete-all-records'})
+    recordPages.resources = 1
+    await refresh(false)
+  }, '所有秒传记录已删除')
 })
 
 $('deleteUser').addEventListener('click', () => {

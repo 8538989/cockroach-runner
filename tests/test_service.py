@@ -10,6 +10,50 @@ import service  # noqa: E402
 
 
 class ScanTests(unittest.TestCase):
+    def test_bulk_delivery_actions_and_record_deletion(self):
+        with tempfile.TemporaryDirectory() as data_dir:
+            store = service.Store(data_dir, Fernet.generate_key().decode())
+            stamp = service.now()
+            with store.db:
+                store.db.execute("INSERT INTO users(tg_id,created,updated) VALUES(1,?,?)", (stamp, stamp))
+                for index, status in enumerate(("waiting", "cancelled", "delivered"), 1):
+                    store.db.execute("INSERT INTO resources(id,node_id,name,first_seen) VALUES(?,?,?,?)", (f"r{index}", str(index), f"Video{index}.mkv", stamp))
+                    store.db.execute("INSERT INTO deliveries(id,resource_id,tg_id,status,created,updated) VALUES(?,?,1,?,?,?)", (f"d{index}", f"r{index}", status, stamp, stamp))
+            self.assertEqual(store.delivery_action({"action": "retry-all"}), 2)
+            self.assertEqual(store.db.execute("SELECT status FROM deliveries WHERE id='d3'").fetchone()[0], "delivered")
+            self.assertEqual(store.delivery_action({"action": "cancel-all"}), 2)
+            self.assertEqual(store.db.execute("SELECT COUNT(*) FROM deliveries WHERE status='cancelled'").fetchone()[0], 2)
+            self.assertEqual(store.delivery_action({"action": "delete-all"}), 3)
+            self.assertEqual(store.db.execute("SELECT COUNT(*) FROM deliveries").fetchone()[0], 0)
+            store.db.close()
+
+    def test_admin_records_are_paginated_at_one_hundred(self):
+        with tempfile.TemporaryDirectory() as data_dir:
+            store = service.Store(data_dir, Fernet.generate_key().decode())
+            stamp = service.now()
+            with store.db:
+                store.db.execute("INSERT INTO users(tg_id,name,created,updated) VALUES(1,'User',?,?)", (stamp, stamp))
+                for index in range(205):
+                    store.db.execute("INSERT INTO resources(id,node_id,name,first_seen) VALUES(?,?,?,?)", (f"r{index:03}", str(index), f"Video{index:03}.mkv", stamp + index))
+                    store.db.execute("INSERT INTO deliveries(id,resource_id,tg_id,created,updated) VALUES(?,?,1,?,?)", (f"d{index:03}", f"r{index:03}", stamp + index, stamp + index))
+            first = store.records_page("deliveries", 1, 100)
+            third = store.records_page("resources", 3, 100)
+            self.assertEqual((len(first["items"]), first["total"], first["pages"]), (100, 205, 3))
+            self.assertEqual((len(third["items"]), third["page"], third["page_size"]), (5, 3, 100))
+            store.db.close()
+
+    def test_delete_all_resource_records_keeps_resources_for_deduplication(self):
+        with tempfile.TemporaryDirectory() as data_dir:
+            store = service.Store(data_dir, Fernet.generate_key().decode())
+            stamp = service.now()
+            with store.db:
+                store.db.execute("INSERT INTO resources(id,node_id,name,first_seen) VALUES('r1','1','One.mkv',?)", (stamp,))
+                store.db.execute("INSERT INTO resources(id,node_id,name,first_seen) VALUES('r2','2','Two.mkv',?)", (stamp,))
+            self.assertEqual(store.resource_action({"action": "delete-all-records"}), 2)
+            self.assertEqual(store.db.execute("SELECT COUNT(*) FROM resources WHERE hidden=1").fetchone()[0], 2)
+            self.assertEqual(store.records_page("resources", 1)["total"], 0)
+            store.db.close()
+
     def test_store_recovers_running_delivery_after_restart(self):
         with tempfile.TemporaryDirectory() as data_dir:
             key = Fernet.generate_key().decode()
@@ -289,10 +333,10 @@ class ScanTests(unittest.TestCase):
                 store.db.execute("INSERT INTO users(tg_id,created,updated) VALUES(2,?,?)", (stamp, stamp))
                 store.db.execute("INSERT INTO deliveries(id,resource_id,tg_id,status,created,updated) VALUES('d1','r',1,'delivered',?,?)", (stamp, stamp))
                 store.db.execute("INSERT INTO deliveries(id,resource_id,tg_id,status,created,updated) VALUES('d2','r',2,'cancelled',?,?)", (stamp, stamp))
-            record = next(item for item in store.overview()["resources"] if item["id"] == "r")
+            record = next(item for item in store.records_page("resources")["items"] if item["id"] == "r")
             self.assertEqual((record["delivery_total"], record["delivery_done"], record["delivery_failed"]), (2, 1, 1))
             store.resource_action({"id": "r", "action": "delete-record"})
-            self.assertFalse(any(item["id"] == "r" for item in store.overview()["resources"]))
+            self.assertFalse(any(item["id"] == "r" for item in store.records_page("resources")["items"]))
             self.assertEqual(store.db.execute("SELECT hidden FROM resources WHERE id='r'").fetchone()[0], 1)
             store.db.close()
 

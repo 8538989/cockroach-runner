@@ -48,8 +48,9 @@
       </section>
 
       <section id="deliveriesPanel" class="panel">
-        <div class="section-head"><div><h2>派送任务</h2><p>查看进度、错误与重试次数，可手动重派或取消。</p></div><button class="refresh">刷新</button></div>
+        <div class="section-head"><div><h2>派送任务</h2><p>查看进度、错误与重试次数，可手动重派或取消。</p></div><div class="head-actions"><button class="refresh">刷新</button><button id="retryAllDeliveries">全部重试</button><button id="cancelAllDeliveries" class="danger-button">全部取消</button><button id="deleteAllDeliveries" class="danger-button">删除所有任务记录</button></div></div>
         <div class="table-wrap"><table><thead><tr><th>资源</th><th>用户</th><th>状态</th><th>尝试</th><th>更新时间 / 错误</th><th></th></tr></thead><tbody id="deliveriesBody"></tbody></table></div>
+        <div class="pager"><button id="deliveriesPrev">上一页</button><span id="deliveriesPageInfo">第 1 / 1 页</span><button id="deliveriesNext">下一页</button><small>每页 100 条</small></div>
       </section>
 
       <section id="sourcesPanel" class="panel">
@@ -65,8 +66,9 @@
       </section>
 
       <section id="cleanupPanel" class="panel">
-        <div class="section-head"><div><h2>秒传记录</h2><p>查看每个资源的实时派送汇总与源文件清理状态。删除记录不会删除 115 文件。</p></div><button class="refresh">刷新</button></div>
+        <div class="section-head"><div><h2>秒传记录</h2><p>查看每个资源的实时派送汇总与源文件清理状态。删除记录不会删除 115 文件。</p></div><div class="head-actions"><button class="refresh">刷新</button><button id="deleteAllResources" class="danger-button">一键删除所有记录</button></div></div>
         <div class="table-wrap"><table><thead><tr><th>资源</th><th>监听目录</th><th>派送状态</th><th>清理状态</th><th>计划时间 / 错误</th><th></th></tr></thead><tbody id="resourcesBody"></tbody></table></div>
+        <div class="pager"><button id="resourcesPrev">上一页</button><span id="resourcesPageInfo">第 1 / 1 页</span><button id="resourcesNext">下一页</button><small>每页 100 条</small></div>
       </section>
 
       <section id="settingsPanel" class="panel">
