@@ -38,6 +38,8 @@ QR_LOGIN_APPS = {
 
 def now(): return int(time.time())
 def dumps(value): return json.dumps(value, ensure_ascii=False, separators=(",", ":"))
+def redact_sensitive_text(value):
+    return re.sub(r"(['\"]?(?:user_key|cookie|authorization)['\"]?\s*[:=]\s*)('[^']*'|\"[^\"]*\"|[^,;}\s]+)",r"\1'***'",str(value),flags=re.I)
 
 
 class RateGate:
@@ -120,6 +122,10 @@ class Store:
               error=CASE WHEN error='' THEN '服务重启后自动恢复未完成任务' ELSE error END WHERE status='running'""", (stamp,))
             self.db.execute("""UPDATE resources SET cleanup='retained'
               WHERE cleanup='waiting' AND source_id IN (SELECT id FROM sources WHERE retention_minutes<0)""")
+            for row in self.db.execute("SELECT id,error FROM deliveries WHERE error LIKE '%user_key%' OR error LIKE '%cookie%'").fetchall():
+                self.db.execute("UPDATE deliveries SET error=? WHERE id=?",(redact_sensitive_text(row["error"]),row["id"]))
+            for row in self.db.execute("SELECT id,message FROM events WHERE message LIKE '%user_key%' OR message LIKE '%cookie%'").fetchall():
+                self.db.execute("UPDATE events SET message=? WHERE id=?",(redact_sensitive_text(row["message"]),row["id"]))
 
     def set(self, key, value, secret=False):
         text = dumps(value)
@@ -848,8 +854,7 @@ class Application:
         payload=exc.args[0] if getattr(exc,"args",None) and isinstance(exc.args[0],dict) else None
         if payload and {"pid","filename","filesha1","user_id"}.issubset(payload):
             return f"115 秒传初始化失败（目标账号 UID {payload.get('user_id')}，可能触发风控、秒传验证未通过或接口暂时异常）"
-        text=str(exc)
-        text=re.sub(r"(['\"]?(?:user_key|cookie|authorization)['\"]?\s*[:=]\s*)[^,;}]+",r"\1***",text,flags=re.I)
+        text=redact_sensitive_text(exc)
         if "[Errno 61]" in text: return "115 接口暂时拒绝请求（Errno 61）"
         return text[:500]
 
