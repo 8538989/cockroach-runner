@@ -96,6 +96,9 @@ function renderSettings(config = {}) {
   $('searchLimit').value = config.search_limit ?? 20
   $('logDays').value = config.log_days ?? 30
   $('defaultCategory').value = config.default_category || '其他'
+  $('p115ApiInterval').value = config.p115_api_interval_seconds ?? 1
+  $('cd2ApiInterval').value = config.cd2_api_interval_seconds ?? 1
+  $('transferInterval').value = config.transfer_interval_seconds ?? 3
   $('enabled').checked = Boolean(config.enabled)
   $('miniEnabled').checked = config.mini_enabled !== false
   $('botToken').placeholder = config.bot_configured ? '已配置，留空表示不修改' : '尚未配置'
@@ -330,6 +333,9 @@ $('save').addEventListener('click', () => perform(async () => {
     search_limit: Number($('searchLimit').value || 20),
     log_days: Number($('logDays').value || 30),
     default_category: $('defaultCategory').value.trim() || '其他',
+    p115_api_interval_seconds: Number($('p115ApiInterval').value || 0),
+    cd2_api_interval_seconds: Number($('cd2ApiInterval').value || 0),
+    transfer_interval_seconds: Number($('transferInterval').value || 0),
     enabled: $('enabled').checked,
     mini_enabled: $('miniEnabled').checked,
     cd2_mode: $('cd2Mode').value,

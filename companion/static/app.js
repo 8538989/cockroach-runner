@@ -217,7 +217,7 @@ function shell(content) {
   const user = state.profile || {};
   return `<main class="member-shell">
     <header class="brand-row">
-      <a class="brand" href="#" data-page="home">蟑螂快跑<span>COCKROACH RUNNER</span></a>
+      <a class="brand brand-with-icon" href="#" data-page="home"><video src="/brand-icon.mp4" autoplay muted loop playsinline aria-label="蟑影递送图标"></video><span class="brand-copy">蟑影递送<small>SHADOW DELIVERY</small></span></a>
       <span class="muted">${esc(user.name || user.username || user.tg_id || "")}</span>
     </header>
     ${content}
@@ -235,7 +235,7 @@ function home() {
   return shell(`<section class="panel hero-panel">
     <span class="badge ${member.active ? "green" : "red"}">${esc(member.text)}</span>
     <h1>晚上好，${esc(user.name || user.username || "朋友")}</h1>
-    <p>这里已经接入你的自制小程序风格，用来管理 115 账号、自动接收规则和派送记录。</p>
+    <p>欢迎来到蟑影，祝你有个美好观影体验。</p>
   </section>
   <section class="panel membership-panel ${member.active ? "" : "expired-membership"}">
     <div><small>会员有效期</small><strong>${esc(member.text)}</strong></div>

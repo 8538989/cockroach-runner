@@ -14,6 +14,7 @@ class ScanTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as data_dir:
             store = service.Store(data_dir, Fernet.generate_key().decode())
             store.set("source_cookie", "source", True)
+            store.set("p115_api_interval_seconds", 0)
             store.upsert_user(123)
             store.save_user(123, {"cookie": "target", "uid": "u1"})
             app = service.Application(store)
@@ -95,6 +96,8 @@ class ScanTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as data_dir:
             store = service.Store(data_dir, Fernet.generate_key().decode())
             store.set("source_cookie", "source", True)
+            store.set("p115_api_interval_seconds", 0)
+            store.set("cd2_api_interval_seconds", 0)
             store.upsert_user(123)
             store.save_user(123, {"cookie": "target", "uid": "u1"})
             stamp = service.now()
@@ -179,6 +182,8 @@ class ScanTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as data_dir:
             store = service.Store(data_dir, Fernet.generate_key().decode())
             store.set("source_cookie", "source", True)
+            store.set("p115_api_interval_seconds", 0)
+            store.set("cd2_api_interval_seconds", 0)
             store.upsert_user(123)
             store.save_user(123, {"cookie": "target", "uid": "u1"})
             watched = Path(data_dir) / "watched"
@@ -257,9 +262,21 @@ class ScanTests(unittest.TestCase):
         original_list = service.P115.list_dir
         try:
             service.P115.list_dir = staticmethod(lambda cookie, cid: entries)
-            self.assertEqual(service.Application.folders_115("cookie", "0"), [{"name": "Movies", "cid": "10", "is_dir": True}])
+            with tempfile.TemporaryDirectory() as data_dir:
+                store = service.Store(data_dir, Fernet.generate_key().decode())
+                store.set("p115_api_interval_seconds", 0)
+                self.assertEqual(service.Application(store).folders_115("cookie", "0"), [{"name": "Movies", "cid": "10", "is_dir": True}])
+                store.db.close()
         finally:
             service.P115.list_dir = original_list
+
+    def test_api_interval_settings_are_clamped_and_exposed(self):
+        with tempfile.TemporaryDirectory() as data_dir:
+            store = service.Store(data_dir, Fernet.generate_key().decode())
+            store.save_config({"p115_api_interval_seconds": 1.5, "cd2_api_interval_seconds": -1, "transfer_interval_seconds": 9999})
+            cfg = store.config()
+            self.assertEqual((cfg["p115_api_interval_seconds"], cfg["cd2_api_interval_seconds"], cfg["transfer_interval_seconds"]), (1.5, 0.0, 3600.0))
+            store.db.close()
 
     def test_cd2_mount_browser_stays_inside_configured_root(self):
         with tempfile.TemporaryDirectory() as root:

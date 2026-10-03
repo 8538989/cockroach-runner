@@ -20,7 +20,7 @@ from pathlib import Path
 
 from cryptography.fernet import Fernet, InvalidToken
 
-APP_NAME = "蟑螂快跑"
+APP_NAME = "蟑影递送"
 VIDEO_EXTENSIONS = {".mkv", ".mp4", ".avi", ".mov", ".wmv", ".ts", ".m2ts", ".iso"}
 QR_LOGIN_APPS = {
     "alipaymini": "115生活（支付宝小程序）",
@@ -38,6 +38,20 @@ QR_LOGIN_APPS = {
 
 def now(): return int(time.time())
 def dumps(value): return json.dumps(value, ensure_ascii=False, separators=(",", ":"))
+
+
+class RateGate:
+    def __init__(self):
+        self.lock = threading.Lock()
+        self.last = 0.0
+
+    def wait(self, seconds):
+        interval = max(0.0, min(3600.0, float(seconds or 0)))
+        if interval <= 0: return
+        with self.lock:
+            delay = interval - (time.monotonic() - self.last)
+            if delay > 0: time.sleep(delay)
+            self.last = time.monotonic()
 
 
 class Store:
@@ -141,6 +155,9 @@ class Store:
             "cd2_root": self.get("cd2_root", "/cd2/miaochuang"),
             "cd2_api_root": self.get("cd2_api_root", "/"),
             "cd2_token_configured": bool(self.get("cd2_api_token", "")),
+            "p115_api_interval_seconds": self.get("p115_api_interval_seconds", 1),
+            "cd2_api_interval_seconds": self.get("cd2_api_interval_seconds", 1),
+            "transfer_interval_seconds": self.get("transfer_interval_seconds", 3),
         }
         if include_secrets:
             result["bot_token"] = self.get("bot_token", "")
@@ -151,9 +168,12 @@ class Store:
     def save_config(self, value):
         if "cd2_mode" in value and value["cd2_mode"] not in {"mount", "api"}: raise ValueError("CD2 接入方式无效")
         if "cd2_port" in value: value["cd2_port"] = max(1, min(65535, int(value["cd2_port"])))
+        for key in ("p115_api_interval_seconds", "cd2_api_interval_seconds", "transfer_interval_seconds"):
+            if key in value: value[key] = max(0.0, min(3600.0, float(value[key])))
         allowed = {"public_url", "source_cid", "scan_seconds", "enabled", "default_category", "concurrency",
                    "check_hours", "retry_minutes", "max_attempts", "search_limit", "log_days", "mini_enabled", "theme",
                    "cd2_mode", "cd2_host", "cd2_port", "cd2_root", "cd2_api_root"}
+        allowed.update({"p115_api_interval_seconds", "cd2_api_interval_seconds", "transfer_interval_seconds"})
         for key in allowed:
             if key in value: self.set(key, value[key])
         if value.get("bot_token"): self.set("bot_token", str(value["bot_token"]).strip(), True)
@@ -405,11 +425,11 @@ class Telegram:
                 self.app.store.event("绑定",f"Telegram 用户完成绑定：{tg_id}",str(tg_id))
             except ValueError as exc: return self.send(tg_id,str(exc),False)
             expires=time.strftime("%Y-%m-%d %H:%M",time.localtime(membership["membership_expires"]))
-            self.send(sender["id"], f"<b>蟑螂快跑已连接</b>\n会员有效期至：{expires}\n点击下方按钮绑定115并设置接收规则。")
+            self.send(sender["id"], f"<b>蟑影递送已连接</b>\n会员有效期至：{expires}\n点击下方按钮绑定115并设置接收规则。")
         elif text.startswith("/start"):
             if not user: return self.send(tg_id,"尚未绑定。请向管理员索取绑定码，然后发送 <code>/bind 绑定码</code>。",False)
             self.app.store.upsert_user(tg_id,sender.get("username",""),name)
-            self.send(tg_id,"<b>蟑螂快跑已连接</b>\n点击下方按钮管理115账号和接收规则。")
+            self.send(tg_id,"<b>蟑影递送已连接</b>\n点击下方按钮管理115账号和接收规则。")
         elif not user:
             self.send(tg_id,"尚未绑定。请发送 <code>/bind 绑定码</code>。",False)
         elif text.startswith("/status"):
@@ -699,6 +719,9 @@ class Application:
         self.cd2_snapshots = {}
         self.qr_sessions = {}
         self.qr_lock = threading.Lock()
+        self.p115_gate = RateGate()
+        self.cd2_gate = RateGate()
+        self.transfer_gate = RateGate()
 
     def mini_user(self, init_data):
         if not self.store.get("mini_enabled",True): raise PermissionError("小程序当前已停用")
@@ -743,9 +766,9 @@ class Application:
         self.store.event("用户管理",f"扫码绑定115：{tg_id}",str(tg_id))
         return {"status":"confirmed","user":user,"account":profile}
 
-    @staticmethod
-    def folders_115(cookie, cid="0"):
+    def folders_115(self, cookie, cid="0"):
         if not cookie: raise RuntimeError("尚未配置可用的 115 Cookie")
+        self.p115_gate.wait(self.store.get("p115_api_interval_seconds", 1))
         folders = [entry for entry in P115.list_dir(cookie, str(cid or "0")) if entry["is_dir"]]
         return [{"name": item["name"], "cid": item["node_id"], "is_dir": True} for item in folders]
 
@@ -762,6 +785,7 @@ class Application:
             cfg = self.store.config(True)
             mode = str(query.get("mode", [cfg.get("cd2_mode", "mount")])[0] or cfg.get("cd2_mode", "mount"))
             path = str(query.get("path", [""])[0] or (cfg.get("cd2_api_root") if mode == "api" else cfg.get("cd2_root")))
+            self.cd2_gate.wait(cfg.get("cd2_api_interval_seconds", 1))
             return {"provider": "cd2", "mode": mode, "path": path, "items": [item for item in CD2.list_dir(cfg, path, mode) if item["is_dir"]]}
         raise ValueError("不支持的目录来源")
 
@@ -793,6 +817,7 @@ class Application:
 
     def cd2_entries(self, cfg, source, force=False):
         mode = "api" if source.get("monitor_type") == "cd2_api" else "mount"
+        self.cd2_gate.wait(cfg.get("cd2_api_interval_seconds", 1))
         entries = [item["name"] for item in CD2.list_dir(cfg, source["cd2_path"], mode)]
         snapshot = hashlib.sha256(dumps(sorted(entries)).encode()).hexdigest()
         previous = self.cd2_snapshots.get(source["id"])
@@ -815,6 +840,7 @@ class Application:
                             self.store.db.execute("UPDATE sources SET last_scan=?,next_scan=?,error='',updated=? WHERE id=?",(stamp,stamp+interval,stamp,source["id"]))
                         return ""
                 local_names = set(local)
+            self.p115_gate.wait(cfg.get("p115_api_interval_seconds", 1))
             entries=P115.list_dir(cfg["source_cookie"],source["cid"])
             if local_names is not None: entries = [entry for entry in entries if entry["name"] in local_names]
             discovered=0
@@ -884,6 +910,7 @@ class Application:
 
     def deliver_one(self,cfg,item):
         try:
+            self.transfer_gate.wait(cfg.get("transfer_interval_seconds", 3))
             cookie = self.store.crypt.decrypt(item["cookie"].encode()).decode()
             with self.store.lock, self.store.db: self.store.db.execute("UPDATE deliveries SET status='running',attempts=attempts+1,updated=? WHERE id=?", (now(), item["id"]))
             P115.transfer(cfg["source_cookie"], cookie, item, item["target_cid"])
@@ -912,6 +939,7 @@ class Application:
         for row in rows:
             item=dict(row)
             try:
+                self.p115_gate.wait(cfg.get("p115_api_interval_seconds", 1))
                 P115.delete(cfg["source_cookie"],item["node_id"])
                 with self.store.lock,self.store.db: self.store.db.execute("UPDATE resources SET cleanup='deleted',status='deleted',cleanup_error='' WHERE id=?",(item["id"],))
                 self.store.event("清理",f"秒传后删除源文件：{item['name']}",item["id"])
@@ -980,6 +1008,7 @@ class Handler(BaseHTTPRequestHandler):
             if path == "/admin.css": return self.send_file("admin.css", "text/css; charset=utf-8")
             if path == "/style.css": return self.send_file("style.css", "text/css; charset=utf-8")
             if path == "/qr.css": return self.send_file("qr.css", "text/css; charset=utf-8")
+            if path == "/brand-icon.mp4": return self.send_file("brand-icon.mp4", "video/mp4")
             if path == "/api/admin/status" and method == "GET": self.admin(); return self.send_json(200, self.app.store.status())
             if path == "/api/admin/overview" and method == "GET": self.admin(); return self.send_json(200, self.app.store.overview())
             if path == "/api/admin/config" and method == "PUT": self.admin(); self.app.store.save_config(self.body()); return self.send_json(200, {**self.app.store.status(), "message": "配置已保存"})

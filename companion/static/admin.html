@@ -4,14 +4,14 @@
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width,initial-scale=1">
   <meta name="theme-color" content="#f4f7fb">
-  <title>蟑螂快跑 · 管理中心</title>
+  <title>蟑影递送 · 管理中心</title>
   <link rel="stylesheet" href="/admin.css">
 </head>
 <body>
   <main class="admin-shell">
     <header class="hero">
-      <div class="logo">🪳</div>
-      <div><h1>蟑螂快跑</h1><p>独立服务管理中心 · 不依赖 DIAN115</p></div>
+      <video class="logo" src="/brand-icon.mp4" autoplay muted loop playsinline aria-label="蟑影递送图标"></video>
+      <div><h1>蟑影递送</h1></div>
     </header>
 
     <section id="loginCard" class="card login-card">
@@ -88,6 +88,9 @@
           <label class="field"><span>默认搜索额度</span><input id="searchLimit" type="number" min="1" max="1000"></label>
           <label class="field"><span>日志保留（天）</span><input id="logDays" type="number" min="1" max="365"></label>
           <label class="field"><span>默认分类</span><input id="defaultCategory"></label>
+          <label class="field"><span>115 API 最小间隔（秒）</span><input id="p115ApiInterval" type="number" min="0" max="3600" step="0.1"></label>
+          <label class="field"><span>CD2 API 最小间隔（秒）</span><input id="cd2ApiInterval" type="number" min="0" max="3600" step="0.1"></label>
+          <label class="field"><span>秒传任务最小间隔（秒）</span><input id="transferInterval" type="number" min="0" max="3600" step="0.1"></label>
         </div>
         <div class="checks"><label class="check"><input id="enabled" type="checkbox"> 启用自动扫描与派送</label><label class="check"><input id="miniEnabled" type="checkbox"> 启用 Telegram 小程序</label></div>
         <div class="actions"><button id="save" class="primary">保存设置</button><button id="testBot">测试 Bot</button><button id="testCd2">测试 CD2</button><button id="scan">立即扫描</button></div>
