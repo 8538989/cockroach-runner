@@ -1,0 +1,24 @@
+[Unit]
+Description=Cockroach Runner 115 Delivery Service
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=cockroach-runner
+Group=cockroach-runner
+WorkingDirectory=/opt/cockroach-runner
+EnvironmentFile=/etc/cockroach-runner.env
+ExecStart=/opt/cockroach-runner/venv/bin/python /opt/cockroach-runner/service.py --port 8790 --data /var/lib/cockroach-runner --static /opt/cockroach-runner/static
+Restart=on-failure
+RestartSec=3
+NoNewPrivileges=yes
+PrivateTmp=yes
+ProtectSystem=strict
+ProtectHome=yes
+ReadWritePaths=/var/lib/cockroach-runner
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX
+UMask=0077
+
+[Install]
+WantedBy=multi-user.target

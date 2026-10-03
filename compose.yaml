@@ -1,0 +1,18 @@
+services:
+  cockroach-runner:
+    build: .
+    image: cockroach-runner:latest
+    container_name: cockroach-runner
+    restart: unless-stopped
+    environment:
+      COCKROACH_ADMIN_KEY: ${COCKROACH_ADMIN_KEY:?请在 .env 中设置管理密钥}
+      COCKROACH_ENCRYPTION_KEY: ${COCKROACH_ENCRYPTION_KEY:?请在 .env 中设置 Fernet 密钥}
+    ports:
+      - "${COCKROACH_PORT:-8790}:8790"
+    volumes:
+      - cockroach-data:/data
+    security_opt:
+      - no-new-privileges:true
+
+volumes:
+  cockroach-data:

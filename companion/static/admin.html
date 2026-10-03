@@ -1,0 +1,134 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <meta name="theme-color" content="#0c120e">
+  <title>蟑螂快跑 · 管理中心</title>
+  <link rel="stylesheet" href="/style.css">
+  <link rel="stylesheet" href="/admin.css">
+</head>
+<body>
+  <main class="admin-shell">
+    <header class="hero">
+      <div class="logo">🪳</div>
+      <div><h1>蟑螂快跑</h1><p>独立服务管理中心 · 不依赖 DIAN115</p></div>
+    </header>
+
+    <section class="card connect-card">
+      <label class="field"><span>管理密钥</span><input id="adminKey" type="password" autocomplete="current-password" placeholder="COCKROACH_ADMIN_KEY"></label>
+      <div class="actions"><button id="connect" class="primary">连接并刷新</button><span id="connection" class="status">尚未连接</span></div>
+    </section>
+
+    <section id="dashboard" hidden>
+      <div class="stats">
+        <article class="card"><small>用户</small><strong id="users">0</strong></article>
+        <article class="card"><small>待处理派送</small><strong id="pending">0</strong></article>
+        <article class="card"><small>成功派送</small><strong id="delivered">0</strong></article>
+        <article class="card"><small>监听目录</small><strong id="sourceCount">0</strong></article>
+      </div>
+
+      <nav class="tabs" aria-label="管理功能">
+        <button class="tab active" data-tab="usersPanel">用户管理</button>
+        <button class="tab" data-tab="deliveriesPanel">派送任务</button>
+        <button class="tab" data-tab="sourcesPanel">监听目录</button>
+        <button class="tab" data-tab="bindingsPanel">绑定码</button>
+        <button class="tab" data-tab="cleanupPanel">秒传后删除</button>
+        <button class="tab" data-tab="settingsPanel">服务设置</button>
+        <button class="tab" data-tab="eventsPanel">运行记录</button>
+      </nav>
+
+      <section id="usersPanel" class="panel active">
+        <div class="section-head"><div><h2>用户管理</h2><p>管理账号状态、目标目录、订阅规则和搜索额度。</p></div><button class="refresh">刷新</button></div>
+        <div class="table-wrap"><table><thead><tr><th>用户</th><th>115 / CK</th><th>目标目录</th><th>订阅</th><th>状态</th><th></th></tr></thead><tbody id="usersBody"></tbody></table></div>
+      </section>
+
+      <section id="deliveriesPanel" class="panel">
+        <div class="section-head"><div><h2>派送任务</h2><p>查看进度、错误与重试次数，可手动重派或取消。</p></div><button class="refresh">刷新</button></div>
+        <div class="table-wrap"><table><thead><tr><th>资源</th><th>用户</th><th>状态</th><th>尝试</th><th>更新时间 / 错误</th><th></th></tr></thead><tbody id="deliveriesBody"></tbody></table></div>
+      </section>
+
+      <section id="sourcesPanel" class="panel">
+        <div class="section-head"><div><h2>监听目录</h2><p>可独立设置扫描、文件稳定等待和源文件保留时间。</p></div><div class="head-actions"><button class="refresh">刷新</button><button id="newSource" class="primary">添加目录</button></div></div>
+        <div id="sourcesList" class="source-grid"></div>
+      </section>
+
+      <section id="bindingsPanel" class="panel">
+        <div class="section-head"><div><h2>一次性绑定码</h2><p>用户在 Telegram Bot 中发送 <code>/bind 绑定码</code> 后获得访问权。</p></div><button class="refresh">刷新</button></div>
+        <div class="inline-form"><label class="field"><span>有效期（分钟）</span><input id="bindingMinutes" type="number" min="5" max="1440" value="30"></label><button id="createBinding" class="primary">生成绑定码</button></div>
+        <div id="bindingResult" class="binding-result" hidden></div>
+        <div class="table-wrap"><table><thead><tr><th>尾号</th><th>状态</th><th>使用者</th><th>到期时间</th><th></th></tr></thead><tbody id="bindingsBody"></tbody></table></div>
+      </section>
+
+      <section id="cleanupPanel" class="panel">
+        <div class="section-head"><div><h2>秒传后删除</h2><p>仅在目标文件校验成功，且所有派送完成或取消后，才执行源文件删除。</p></div><button class="refresh">刷新</button></div>
+        <div class="table-wrap"><table><thead><tr><th>资源</th><th>监听目录</th><th>派送状态</th><th>清理状态</th><th>计划时间 / 错误</th></tr></thead><tbody id="resourcesBody"></tbody></table></div>
+      </section>
+
+      <section id="settingsPanel" class="panel">
+        <div class="section-head"><div><h2>服务设置</h2><p>密钥留空即保持原值。监听目录请在“监听目录”页管理。</p></div></div>
+        <div class="grid">
+          <label class="field"><span>Telegram Bot Token</span><input id="botToken" type="password" placeholder="留空表示不修改"></label>
+          <label class="field"><span>小程序 HTTPS 公网地址</span><input id="publicUrl" type="url" placeholder="https://example.com"></label>
+          <label class="field wide"><span>源 115 Cookie</span><textarea id="sourceCookie" rows="3" placeholder="留空表示不修改"></textarea></label>
+          <label class="field"><span>派送并发数</span><input id="concurrency" type="number" min="1" max="10"></label>
+          <label class="field"><span>CK 检查周期（小时）</span><input id="checkHours" type="number" min="1" max="168"></label>
+          <label class="field"><span>失败重试间隔（分钟）</span><input id="retryMinutes" type="number" min="1" max="1440"></label>
+          <label class="field"><span>最大尝试次数</span><input id="maxAttempts" type="number" min="1" max="50"></label>
+          <label class="field"><span>默认搜索额度</span><input id="searchLimit" type="number" min="1" max="1000"></label>
+          <label class="field"><span>日志保留（天）</span><input id="logDays" type="number" min="1" max="365"></label>
+          <label class="field"><span>默认分类</span><input id="defaultCategory"></label>
+        </div>
+        <div class="checks"><label class="check"><input id="enabled" type="checkbox"> 启用自动扫描与派送</label><label class="check"><input id="miniEnabled" type="checkbox"> 启用 Telegram 小程序</label></div>
+        <div class="actions"><button id="save" class="primary">保存设置</button><button id="testBot">测试 Bot</button><button id="scan">立即扫描</button></div>
+      </section>
+
+      <section id="eventsPanel" class="panel">
+        <div class="section-head"><div><h2>运行记录</h2><p>最近 200 条扫描、派送、绑定和清理事件。</p></div><button class="refresh">刷新</button></div>
+        <div class="table-wrap"><table><thead><tr><th>时间</th><th>类型</th><th>内容</th><th>对象</th></tr></thead><tbody id="eventsBody"></tbody></table></div>
+      </section>
+
+      <section id="lastError" class="error" hidden></section>
+    </section>
+    <div id="toast" class="toast" hidden></div>
+  </main>
+
+  <dialog id="userDialog">
+    <form id="userForm" method="dialog">
+      <div class="dialog-head"><h2>编辑用户</h2><button type="button" class="icon-button close-dialog" aria-label="关闭">×</button></div>
+      <input id="userTgId" type="hidden">
+      <div class="grid">
+        <label class="field"><span>状态</span><select id="userStatus"><option value="active">正常</option><option value="disabled">停用</option></select></label>
+        <label class="field"><span>搜索额度</span><input id="userSearchLimit" type="number" min="1" max="1000"></label>
+        <label class="field"><span>目标目录 CID</span><input id="userTargetCid"></label>
+        <label class="field"><span>目标目录名称</span><input id="userTargetName"></label>
+        <label class="field"><span>订阅模式</span><select id="userMode"><option value="all">全部资源</option><option value="category">指定分类</option><option value="keyword">关键词</option></select></label>
+        <label class="field"><span>分类（逗号分隔）</span><input id="userCategories"></label>
+        <label class="field"><span>包含关键词</span><input id="userIncludeTerms"></label>
+        <label class="field"><span>排除关键词</span><input id="userExcludeTerms"></label>
+        <label class="field wide"><span>备注</span><textarea id="userNote" rows="2"></textarea></label>
+      </div>
+      <div class="checks"><label class="check"><input id="userEnabled" type="checkbox"> 接收派送</label><label class="check"><input id="userHierarchy" type="checkbox"> 保留目录层级</label></div>
+      <div class="dialog-actions"><button type="button" class="close-dialog">取消</button><button type="submit" class="primary">保存用户</button></div>
+    </form>
+  </dialog>
+
+  <dialog id="sourceDialog">
+    <form id="sourceForm" method="dialog">
+      <div class="dialog-head"><h2>监听目录</h2><button type="button" class="icon-button close-dialog" aria-label="关闭">×</button></div>
+      <input id="sourceId" type="hidden">
+      <div class="grid">
+        <label class="field"><span>名称</span><input id="sourceName" required></label>
+        <label class="field"><span>目录 CID</span><input id="sourceCid" required></label>
+        <label class="field"><span>扫描间隔（秒）</span><input id="sourcePoll" type="number" min="15" max="3600" value="60"></label>
+        <label class="field"><span>稳定等待（秒）</span><input id="sourceStable" type="number" min="0" max="86400" value="30"></label>
+        <label class="field wide"><span>秒传成功后删除源文件</span><select id="sourceRetention"><option value="-1">永久保留（默认）</option><option value="0">立即删除</option><option value="10">10 分钟后</option><option value="60">1 小时后</option><option value="1440">1 天后</option><option value="10080">7 天后</option></select></label>
+      </div>
+      <label class="check"><input id="sourceEnabled" type="checkbox" checked> 启用监听</label>
+      <div class="dialog-actions"><button type="button" class="close-dialog">取消</button><button type="submit" class="primary">保存目录</button></div>
+    </form>
+  </dialog>
+
+  <script type="module" src="/admin.js"></script>
+</body>
+</html>

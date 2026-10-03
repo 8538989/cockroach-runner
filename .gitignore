@@ -1,0 +1,22 @@
+.env
+data/
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.coverage
+node_modules/
+build/
+dist/
+
+# 本仓库发布纯独立 Docker 服务，不包含 DIAN115 插件兼容层。
+plugin/
+releases/
+*.d115p
+
+# 本地运行和编辑器文件
+*.db
+*.db-shm
+*.db-wal
+.idea/
+.vscode/
+Thumbs.db
