@@ -22,6 +22,18 @@ from cryptography.fernet import Fernet, InvalidToken
 
 APP_NAME = "蟑螂快跑"
 VIDEO_EXTENSIONS = {".mkv", ".mp4", ".avi", ".mov", ".wmv", ".ts", ".m2ts", ".iso"}
+QR_LOGIN_APPS = {
+    "alipaymini": "115生活（支付宝小程序）",
+    "web": "网页版",
+    "android": "115生活（Android端）",
+    "ios": "115生活（iOS端）",
+    "115android": "115网盘（Android端）",
+    "115ios": "115网盘（iOS端）",
+    "115ipad": "115网盘（iPad端）",
+    "tv": "115网盘（Android电视端）",
+    "wechatmini": "115生活（微信小程序）",
+    "harmony": "115生活（鸿蒙端）",
+}
 
 
 def now(): return int(time.time())
@@ -408,17 +420,19 @@ class P115:
         return {"uid": uid, "name": name}
 
     @staticmethod
-    def qr_start():
+    def qr_start(app):
         from p115client import P115Client
-        response=P115Client.login_qrcode_token("alipaymini",timeout=20)
+        if app not in QR_LOGIN_APPS: raise ValueError("不支持的115登录端")
+        response=P115Client.login_qrcode_token(app,timeout=20)
         data=response.get("data") if isinstance(response,dict) else None
         if not isinstance(data,dict) or not data.get("uid"): raise RuntimeError((response or {}).get("message") or "生成115二维码失败")
-        image=P115Client.login_qrcode(str(data["uid"]),app="alipaymini",timeout=20)
+        image=P115Client.login_qrcode(str(data["uid"]),app=app,timeout=20)
         return {"uid":str(data["uid"]),"time":data.get("time"),"sign":data.get("sign")}, bytes(image)
 
     @staticmethod
-    def qr_poll(token):
+    def qr_poll(token,app):
         from p115client import P115Client
+        if app not in QR_LOGIN_APPS: raise ValueError("不支持的115登录端")
         response=P115Client.login_qrcode_scan_status(token,timeout=35)
         data=response.get("data") if isinstance(response,dict) else None
         if not isinstance(data,dict):
@@ -427,7 +441,7 @@ class P115:
         if status == 0: return "waiting", ""
         if status == 1: return "scanned", ""
         if status != 2: return "expired", ""
-        result=P115Client.login_qrcode_scan_result(str(token["uid"]),app="alipaymini",timeout=20)
+        result=P115Client.login_qrcode_scan_result(str(token["uid"]),app=app,timeout=20)
         result_data=result.get("data") if isinstance(result,dict) else None
         cookie=(result_data or {}).get("cookie") if isinstance(result_data,dict) else None
         if isinstance(cookie,dict): cookie="; ".join(f"{key}={value}" for key,value in cookie.items() if value is not None)
@@ -607,12 +621,14 @@ class Application:
         self.store.upsert_user(tg_id, user.get("username", ""), " ".join(filter(None, [user.get("first_name"), user.get("last_name")])))
         return tg_id
 
-    def qr_start(self,tg_id):
-        token,image=P115.qr_start(); sid=secrets.token_urlsafe(24); expires=now()+300
+    def qr_start(self,tg_id,value):
+        login_app=str(value.get("app") or "alipaymini")
+        if login_app not in QR_LOGIN_APPS: raise ValueError("不支持的115登录端")
+        token,image=P115.qr_start(login_app); sid=secrets.token_urlsafe(24); expires=now()+300
         with self.qr_lock:
             self.qr_sessions={key:value for key,value in self.qr_sessions.items() if value["expires"]>now()}
-            self.qr_sessions[sid]={"tg_id":tg_id,"token":token,"expires":expires}
-        return {"session":sid,"expires":expires,"image":"data:image/png;base64,"+base64.b64encode(image).decode()}
+            self.qr_sessions[sid]={"tg_id":tg_id,"token":token,"app":login_app,"expires":expires}
+        return {"session":sid,"app":login_app,"app_name":QR_LOGIN_APPS[login_app],"expires":expires,"image":"data:image/png;base64,"+base64.b64encode(image).decode()}
 
     def qr_poll(self,tg_id,value):
         sid=str(value.get("session") or "")
@@ -621,7 +637,7 @@ class Application:
         if session["expires"]<=now():
             with self.qr_lock: self.qr_sessions.pop(sid,None)
             return {"status":"expired"}
-        status,cookie=P115.qr_poll(session["token"])
+        status,cookie=P115.qr_poll(session["token"],session["app"])
         if status != "confirmed": return {"status":status,"expires":session["expires"]}
         profile=P115.profile(cookie)
         user=self.store.save_user(tg_id,{"cookie":cookie,"uid":profile["uid"],"target_cid":str(value.get("target_cid") or "0"),"target_name":str(value.get("target_name") or "根目录")})
@@ -856,13 +872,13 @@ class Handler(BaseHTTPRequestHandler):
                 result=self.app.store.create_binding(value.get("minutes",30)); return self.send_json(200,{"message":"绑定码已创建",**result})
             if path == "/api/admin/test-bot" and method == "POST": self.admin(); info=self.app.telegram.call("getMe"); return self.send_json(200, {**self.app.store.status(), "message": f"Bot 连接正常：@{info.get('username','')}"})
             if path == "/api/admin/scan" and method == "POST": self.admin(); threading.Thread(target=self.app.scan,daemon=True).start(); return self.send_json(202, {**self.app.store.status(), "message": "扫描已启动"})
-            if path == "/api/mini/me" and method == "GET": uid=self.mini(); return self.send_json(200, {"user": self.app.store.user(uid), "categories": ["电影","剧集","动漫","纪录片","其他"]})
+            if path == "/api/mini/me" and method == "GET": uid=self.mini(); return self.send_json(200, {"user": self.app.store.user(uid), "categories": ["电影","剧集","动漫","纪录片","其他"], "qr_apps": QR_LOGIN_APPS})
             if path == "/api/mini/overview" and method == "GET": uid=self.mini(); return self.send_json(200, self.app.store.mini_overview(uid))
             if path == "/api/mini/preferences" and method == "PUT": uid=self.mini(); return self.send_json(200, {"user": self.app.store.save_user(uid, self.body())})
             if path == "/api/mini/account" and method == "PUT":
                 uid=self.mini(); value=self.body(); profile=P115.profile(str(value.get("cookie") or "")); value["uid"]=profile["uid"]
                 return self.send_json(200, {"user": self.app.store.save_user(uid, value), "account": profile})
-            if path == "/api/mini/qr/start" and method == "POST": uid=self.mini(); return self.send_json(200,self.app.qr_start(uid))
+            if path == "/api/mini/qr/start" and method == "POST": uid=self.mini(); return self.send_json(200,self.app.qr_start(uid,self.body()))
             if path == "/api/mini/qr/status" and method == "POST": uid=self.mini(); return self.send_json(200,self.app.qr_poll(uid,self.body()))
             return self.send_json(404, {"error": "接口不存在"})
         except PermissionError as exc: self.send_json(401, {"error": str(exc)})

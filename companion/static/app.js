@@ -10,6 +10,7 @@ const state = {
   page: "home",
   profile: null,
   categories: [],
+  qrApps: {},
   overview: { deliveries: [], events: [], stats: { delivered: 0, pending: 0, failed: 0 } },
   saving: false,
   qr: null,
@@ -61,6 +62,7 @@ async function load() {
   ]);
   state.profile = me.user;
   state.categories = me.categories || [];
+  state.qrApps = me.qr_apps || { alipaymini: "115生活（支付宝小程序）" };
   state.overview = { deliveries: overview.deliveries || [], events: overview.events || [], stats: overview.stats || {} };
 }
 
@@ -127,7 +129,8 @@ async function startQrLogin() {
   state.saving = true;
   try {
     const target = accountValues();
-    const data = await api("/api/mini/qr/start", "POST", {});
+    const app = document.querySelector("#qrApp")?.value || "alipaymini";
+    const data = await api("/api/mini/qr/start", "POST", { app });
     state.qr = { ...data, ...target, status: "waiting" };
     render();
     pollQrLogin();
@@ -251,6 +254,7 @@ function records() {
 function account() {
   const user = state.profile;
   const qrLabels = { waiting: "等待扫码", scanned: "已扫码，请在 115 确认", expired: "二维码已过期", error: "查询失败" };
+  const selectedQrApp = state.qr?.app || "alipaymini";
   return shell(`<section class="panel">
     <div class="identity">
       <div class="avatar">${esc(String(user.name || user.username || "蟑").slice(0, 1))}</div>
@@ -266,10 +270,11 @@ function account() {
     <label class="field"><span>115 Cookie</span><textarea id="cookie" rows="4" placeholder="UID=...; CID=...; SEID=...; KID=..."></textarea></label>
     <label class="field"><span>目标目录 CID</span><input id="cid" value="${esc(user.target_cid || "0")}"></label>
     <label class="field"><span>目标目录名称</span><input id="target" value="${esc(user.target_name || "根目录")}"></label>
+    <label class="field"><span>扫码登录端</span><select id="qrApp" ${state.qr && !["expired","error"].includes(state.qr.status) ? "disabled" : ""}>${Object.entries(state.qrApps).map(([value, label]) => `<option value="${esc(value)}" ${selectedQrApp === value ? "selected" : ""}>${esc(label)}</option>`).join("")}</select></label>
     <button class="primary full" data-qr-start ${state.saving ? "disabled" : ""}>${state.saving ? "正在生成..." : "扫码获取 CK"}</button>
     ${state.qr ? `<div class="qr-card">
       <img src="${state.qr.image}" alt="115 登录二维码">
-      <strong>${esc(qrLabels[state.qr.status] || state.qr.status)}</strong>
+      <strong>${esc(qrLabels[state.qr.status] || state.qr.status)}</strong><span class="qr-app-name">${esc(state.qr.app_name || state.qrApps[state.qr.app] || state.qr.app)}</span>
       <small>${state.qr.error ? esc(state.qr.error) : "请使用 115 App 扫描，并在手机上确认登录。二维码约 5 分钟有效。"}</small>
       ${["expired","error"].includes(state.qr.status) ? '<button class="text-button" data-qr-start>重新生成</button>' : ''}
     </div>` : ''}

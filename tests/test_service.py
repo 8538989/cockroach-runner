@@ -200,10 +200,11 @@ class ScanTests(unittest.TestCase):
             app = service.Application(store)
             original_start, original_poll, original_profile = service.P115.qr_start, service.P115.qr_poll, service.P115.profile
             try:
-                service.P115.qr_start = staticmethod(lambda: ({"uid": "qr", "time": 1, "sign": "s"}, b"png"))
-                service.P115.qr_poll = staticmethod(lambda _token: ("confirmed", "UID=1; CID=2; SEID=3"))
+                service.P115.qr_start = staticmethod(lambda app_name: ({"uid": "qr", "time": 1, "sign": "s", "selected": app_name}, b"png"))
+                service.P115.qr_poll = staticmethod(lambda token, app_name: ("confirmed", "UID=1; CID=2; SEID=3") if token["selected"] == app_name else ("expired", ""))
                 service.P115.profile = staticmethod(lambda _cookie: {"uid": "1", "name": "QR User"})
-                started = app.qr_start(123)
+                started = app.qr_start(123, {"app": "115ios"})
+                self.assertEqual((started["app"], started["app_name"]), ("115ios", "115网盘（iOS端）"))
                 result = app.qr_poll(123, {"session": started["session"], "target_cid": "9", "target_name": "扫码目录"})
                 self.assertEqual(result["status"], "confirmed")
                 user = store.user(123, True)
@@ -211,6 +212,15 @@ class ScanTests(unittest.TestCase):
             finally:
                 service.P115.qr_start, service.P115.qr_poll, service.P115.profile = original_start, original_poll, original_profile
                 store.db.close()
+
+    def test_qr_rejects_unknown_login_app(self):
+        with tempfile.TemporaryDirectory() as data_dir:
+            store = service.Store(data_dir, Fernet.generate_key().decode())
+            store.upsert_user(123)
+            app = service.Application(store)
+            with self.assertRaisesRegex(ValueError, "不支持"):
+                app.qr_start(123, {"app": "unknown-device"})
+            store.db.close()
 
 
 if __name__ == "__main__":
