@@ -149,6 +149,33 @@ class ScanTests(unittest.TestCase):
             self.assertEqual(store.db.execute("SELECT COUNT(*) FROM deliveries WHERE tg_id=123").fetchone()[0], 0)
             store.db.close()
 
+    def test_cd2_unchanged_snapshot_releases_stabilized_resource(self):
+        with tempfile.TemporaryDirectory() as data_dir:
+            store = service.Store(data_dir, Fernet.generate_key().decode())
+            store.set("source_cookie", "source", True)
+            store.upsert_user(123)
+            store.save_user(123, {"cookie": "target", "uid": "u1"})
+            watched = Path(data_dir) / "watched"
+            watched.mkdir()
+            (watched / "New.mkv").touch()
+            with store.db:
+                store.db.execute("UPDATE sources SET baseline_ready=1,monitor_type='cd2_realtime',cd2_path=?,stable_seconds=30 WHERE id='legacy'", (str(watched),))
+            app = service.Application(store)
+            entry = {"node_id": "1", "name": "New.mkv", "is_dir": False, "pickcode": "p", "sha1": "a", "size": 1}
+            original_list = service.P115.list_dir
+            try:
+                service.P115.list_dir = staticmethod(lambda *_args: [entry])
+                source = store.sources()[0]
+                stamp = service.now()
+                app.scan_source(store.config(True), source, stamp, False)
+                self.assertEqual(store.db.execute("SELECT status FROM resources WHERE name='New.mkv'").fetchone()[0], "stabilizing")
+                app.scan_source(store.config(True), store.sources()[0], stamp + 31, False)
+                self.assertEqual(store.db.execute("SELECT status FROM resources WHERE name='New.mkv'").fetchone()[0], "waiting")
+                self.assertEqual(store.db.execute("SELECT COUNT(*) FROM deliveries WHERE resource_id IN (SELECT id FROM resources WHERE name='New.mkv')").fetchone()[0], 1)
+            finally:
+                service.P115.list_dir = original_list
+                store.db.close()
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -596,10 +596,14 @@ class Application:
             if monitor_type.startswith("cd2_"):
                 local, changed = self.cd2_entries(source, force)
                 if not changed:
-                    interval = 2 if monitor_type == "cd2_realtime" else int(source["poll_seconds"])
-                    with self.store.lock,self.store.db:
-                        self.store.db.execute("UPDATE sources SET last_scan=?,next_scan=?,error='',updated=? WHERE id=?",(stamp,stamp+interval,stamp,source["id"]))
-                    return ""
+                    stable_cutoff = stamp - int(source["stable_seconds"])
+                    with self.store.lock:
+                        due = self.store.db.execute("SELECT 1 FROM resources WHERE source_id=? AND status='stabilizing' AND first_seen<=? LIMIT 1", (source["id"], stable_cutoff)).fetchone()
+                    if not due:
+                        interval = 2 if monitor_type == "cd2_realtime" else int(source["poll_seconds"])
+                        with self.store.lock,self.store.db:
+                            self.store.db.execute("UPDATE sources SET last_scan=?,next_scan=?,error='',updated=? WHERE id=?",(stamp,stamp+interval,stamp,source["id"]))
+                        return ""
                 local_names = set(local)
             entries=P115.list_dir(cfg["source_cookie"],source["cid"])
             if local_names is not None: entries = [entry for entry in entries if entry["name"] in local_names]
