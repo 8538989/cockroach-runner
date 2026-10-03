@@ -76,6 +76,7 @@
         <div class="grid">
           <label class="field"><span>Telegram Bot Token</span><input id="botToken" type="password" placeholder="留空表示不修改"></label>
           <label class="field"><span>小程序 HTTPS 公网地址</span><input id="publicUrl" type="url" placeholder="https://example.com"></label>
+          <label class="field"><span>TMDB API Key</span><input id="tmdbApiKey" type="password" placeholder="留空表示不修改"><small>用于派送成功后的中文影视资料与海报推送，加密保存。</small></label>
           <label class="field wide"><span>源 115 Cookie</span><textarea id="sourceCookie" rows="3" placeholder="留空表示不修改"></textarea></label>
           <label class="field"><span>CD2 接入方式</span><select id="cd2Mode"><option value="mount">本地挂载</option><option value="api">CD2 API（gRPC）</option></select></label>
           <label class="field"><span>CD2 挂载根目录（容器内）</span><input id="cd2Root" placeholder="/cd2/miaochuang"></label>
@@ -95,9 +96,9 @@
           <label class="field"><span>秒传任务最小间隔（秒）</span><input id="transferInterval" type="number" min="0" max="3600" step="0.1"></label>
           <label class="field"><span>单个秒传总超时（秒）</span><input id="transferTimeout" type="number" min="30" max="3600" step="1"><small>默认 300 秒；超时后暂停该任务并按退避时间重试。</small></label>
         </div>
-        <div class="checks"><label class="check"><input id="enabled" type="checkbox"> 启用自动扫描与派送</label><label class="check"><input id="distributedTransfer" type="checkbox"> 启用成功账号接力秒传（实验）</label><label class="check"><input id="miniEnabled" type="checkbox"> 启用 Telegram 小程序</label></div>
+        <div class="checks"><label class="check"><input id="enabled" type="checkbox"> 启用自动扫描与派送</label><label class="check"><input id="distributedTransfer" type="checkbox"> 启用成功账号接力秒传（实验）</label><label class="check"><input id="tmdbEnabled" type="checkbox"> 启用 TMDB 海报式成功推送</label><label class="check"><input id="miniEnabled" type="checkbox"> 启用 Telegram 小程序</label></div>
         <p class="setting-note">开启接力后，同一文件任一用户接收成功都会立即唤醒此前出错或暂停的任务；接力账号中的文件都已移动、删除或不可用时，自动回退源账号。候选查找、接力秒传和源账号兜底共用上方“单个秒传总超时”。</p>
-        <div class="actions"><button id="save" class="primary">保存设置</button><button id="testBot">测试 Bot</button><button id="testCd2">测试 CD2</button><button id="scan">立即扫描</button></div>
+        <div class="actions"><button id="save" class="primary">保存设置</button><button id="testBot">测试 Bot</button><button id="testTmdb">测试 TMDB</button><button id="testCd2">测试 CD2</button><button id="scan">立即扫描</button></div>
       </section>
 
       <section id="eventsPanel" class="panel">

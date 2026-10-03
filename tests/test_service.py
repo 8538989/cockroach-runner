@@ -10,6 +10,77 @@ import service  # noqa: E402
 
 
 class ScanTests(unittest.TestCase):
+    def test_tmdb_filename_parser_and_rich_caption(self):
+        item = {"name": "蝙蝠侠：黑暗骑士 (2008) - 2160p.HDR10.HEVC.mkv", "size": 68490000000, "category": "电影"}
+        parsed = service.TMDB.parse_name(item["name"], item["category"])
+        self.assertEqual((parsed["title"], parsed["year"], parsed["media_type"]), ("蝙蝠侠：黑暗骑士", 2008, "movie"))
+        metadata = {"id": 155, "media_type": "movie", "title": "蝙蝠侠：黑暗骑士", "release_date": "2008-07-16",
+                    "vote_average": 8.5, "poster_path": "/poster.jpg", "overview": "蝙蝠侠在打击犯罪的战争中加大了赌注。",
+                    "production_countries": [{"iso_3166_1": "US"}], "genres": [{"name": "动作"}],
+                    "credits": {"cast": [{"id": 3894, "name": "克里斯蒂安·贝尔"}]},
+                    "external_ids": {"imdb_id": "tt0468569"}}
+        caption = service.TMDB.caption(item, metadata)
+        self.assertIn("🎬 <b>蝙蝠侠：黑暗骑士 · 2008</b>", caption)
+        self.assertIn("欧美电影", caption)
+        self.assertIn("TMDB ID", caption)
+        self.assertIn("4K / HDR10 / HEVC / MKV", caption)
+        self.assertIn("IMDb tt0468569", caption)
+        self.assertLess(len(service.re.sub(r"<[^>]+>", "", caption)), 1024)
+        self.assertEqual(service.TMDB.poster(metadata), "https://image.tmdb.org/t/p/w780/poster.jpg")
+
+    def test_tmdb_api_key_is_encrypted_and_hidden_from_public_config(self):
+        with tempfile.TemporaryDirectory() as data_dir:
+            store = service.Store(data_dir, Fernet.generate_key().decode())
+            store.save_config({"tmdb_api_key": "TMDB-SECRET", "tmdb_enabled": True})
+            public = store.config(False); private = store.config(True)
+            raw = store.db.execute("SELECT value,secret FROM settings WHERE key='tmdb_api_key'").fetchone()
+            self.assertNotIn("tmdb_api_key", public)
+            self.assertTrue(public["tmdb_configured"])
+            self.assertTrue(public["tmdb_enabled"])
+            self.assertEqual(private["tmdb_api_key"], "TMDB-SECRET")
+            self.assertNotIn("TMDB-SECRET", raw["value"])
+            self.assertEqual(raw["secret"], 1)
+            store.db.close()
+
+    def test_rich_success_notification_uses_tmdb_poster(self):
+        with tempfile.TemporaryDirectory() as data_dir:
+            store = service.Store(data_dir, Fernet.generate_key().decode())
+            app = service.Application(store)
+            item = {"id": "d", "resource_id": "r", "tg_id": 123, "name": "Movie.2024.2160p.mkv", "size": 100, "category": "电影"}
+            metadata = {"id": 1, "media_type": "movie", "title": "电影", "release_date": "2024-01-01", "poster_path": "/p.jpg"}
+            calls = []
+            app.tmdb_metadata = lambda _key, _item: metadata
+            app.telegram.send_photo = lambda chat_id, photo, caption: calls.append((chat_id, photo, caption))
+            app.notify_delivery_success({"tmdb_enabled": True, "tmdb_api_key": "KEY"}, item)
+            self.assertEqual(calls[0][0:2], (123, "https://image.tmdb.org/t/p/w780/p.jpg"))
+            self.assertIn("🎞 <b>影片资料</b>", calls[0][2])
+            store.db.close()
+
+    def test_notification_failure_does_not_turn_delivered_task_into_failure(self):
+        with tempfile.TemporaryDirectory() as data_dir:
+            store = service.Store(data_dir, Fernet.generate_key().decode())
+            store.set("source_cookie", "source", True)
+            store.set("enabled", True)
+            store.upsert_user(123)
+            store.save_user(123, {"cookie": "target", "uid": "u1"})
+            stamp = service.now()
+            with store.db:
+                store.db.execute("INSERT INTO resources(id,node_id,name,pickcode,sha1,size,is_dir,category,first_seen,status,source_id) VALUES('r','1','Movie.2024.mkv','p','a',1,0,'电影',?,'waiting','legacy')", (stamp,))
+                store.db.execute("INSERT INTO deliveries(id,resource_id,tg_id,created,updated) VALUES('d','r',123,?,?)", (stamp, stamp))
+            app = service.Application(store)
+            original_transfer = service.P115.transfer
+            try:
+                service.P115.transfer = staticmethod(lambda *_args: None)
+                app.telegram.send = lambda *_args, **_kwargs: (_ for _ in ()).throw(TimeoutError("Telegram 超时"))
+                app.deliver(store.config(True))
+                row = store.db.execute("SELECT status,error FROM deliveries WHERE id='d'").fetchone()
+                self.assertEqual((row["status"], row["error"]), ("delivered", ""))
+                event = store.db.execute("SELECT kind,message FROM events WHERE kind='通知失败'").fetchone()
+                self.assertIn("Telegram 超时", event["message"])
+            finally:
+                service.P115.transfer = original_transfer
+                store.db.close()
+
     def test_service_pause_recovers_running_tasks_and_resume_starts_service(self):
         with tempfile.TemporaryDirectory() as data_dir:
             store = service.Store(data_dir, Fernet.generate_key().decode())

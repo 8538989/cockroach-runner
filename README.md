@@ -16,6 +16,7 @@
 - 服务设置：派送并发、CK 检查周期、失败重试、最大尝试次数、默认搜索额度和日志保留。
 - 运行记录：查看最近的扫描、用户、派送、绑定与清理事件。
 - Telegram 小程序：用户可使用 115 App 扫码自动获取 CK，也可手工填写 Cookie；目标目录可直接浏览 115 网盘选择并自动回填 CID。
+- TMDB 海报推送：派送成功后按文件名中的 TMDB ID，或片名、年份和剧集信息匹配中文资料，发送海报、评分、主演、影音规格、IMDb 与剧情简介；查询失败自动降级为普通成功通知。
 - 可视化选目录：管理端可浏览源 115、用户 115 和 CD2 目录，不必手工查找 CID；文本框仍保留用于高级配置和故障兜底。
 
 完整管理中心位于 `/admin`，上述功能全部在独立 Docker 服务内完成。
@@ -38,7 +39,7 @@ docker compose ps
 
 默认只监听服务器本机的 `127.0.0.1:8790`。通过反向代理打开 `https://你的域名/admin`，使用管理员用户名和密码登录，依次配置：
 
-1. Telegram Bot Token 和小程序 HTTPS 公网地址。
+1. Telegram Bot Token、小程序 HTTPS 公网地址和可选的 TMDB API Key。
 2. 用于监听资源的源 115 Cookie。
 3. 在“服务设置”选择 CD2 本地挂载或 CD2 API。API 模式可配置每个部署自己的主机/IP、端口、API Token 和 API 根目录。
 4. 在“监听目录”使用文件夹选择器选择源 115 目录（自动回填 CID）；使用 CD2 时再选择对应的 CD2 目录。
@@ -58,7 +59,7 @@ CD2 本地模式由 `.env` 的 `COCKROACH_CD2_PATH` 指定宿主机目录，并�
 
 ## 数据、备份与迁移
 
-SQLite 数据库保存在 Docker 命名卷 `cockroach-data` 的 `/data/cockroach-runner.db`。Cookie 与 Bot Token 使用 `COCKROACH_ENCRYPTION_KEY` 加密。备份时必须同时保存数据库和 `.env` 中的加密密钥；密钥丢失后，已有 Cookie 和 Token 无法解密。
+SQLite 数据库保存在 Docker 命名卷 `cockroach-data` 的 `/data/cockroach-runner.db`。Cookie、Bot Token 与 TMDB API Key 使用 `COCKROACH_ENCRYPTION_KEY` 加密。备份时必须同时保存数据库和 `.env` 中的加密密钥；密钥丢失后，已有密文无法解密。
 
 若要直接复用旧数据目录，可在 `.env` 设置 `COCKROACH_DATA_DIR=/var/lib/cockroach-runner`，并把 `COCKROACH_UID`、`COCKROACH_GID` 设置为该目录所有者的数字 UID/GID。这样无需复制数据库，也方便快速回滚。
 

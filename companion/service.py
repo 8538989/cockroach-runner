@@ -4,6 +4,7 @@ import base64
 import concurrent.futures
 import hashlib
 import hmac
+import html
 import json
 import os
 import re
@@ -39,7 +40,7 @@ QR_LOGIN_APPS = {
 def now(): return int(time.time())
 def dumps(value): return json.dumps(value, ensure_ascii=False, separators=(",", ":"))
 def redact_sensitive_text(value):
-    return re.sub(r"(['\"]?(?:user_key|cookie|authorization)['\"]?\s*[:=]\s*)('[^']*'|\"[^\"]*\"|[^,;}\s]+)",r"\1'***'",str(value),flags=re.I)
+    return re.sub(r"(['\"]?(?:user_key|cookie|authorization|api_key|tmdb_api_key|token)['\"]?\s*[:=]\s*)('[^']*'|\"[^\"]*\"|[^,;}\s&]+)",r"\1'***'",str(value),flags=re.I)
 
 
 class RateGate:
@@ -172,11 +173,14 @@ class Store:
             "transfer_interval_seconds": self.get("transfer_interval_seconds", 3),
             "transfer_timeout_seconds": self.get("transfer_timeout_seconds", 300),
             "distributed_transfer_enabled": self.get("distributed_transfer_enabled", False),
+            "tmdb_enabled": self.get("tmdb_enabled", False),
+            "tmdb_configured": bool(self.get("tmdb_api_key", "")),
         }
         if include_secrets:
             result["bot_token"] = self.get("bot_token", "")
             result["source_cookie"] = self.get("source_cookie", "")
             result["cd2_api_token"] = self.get("cd2_api_token", "")
+            result["tmdb_api_key"] = self.get("tmdb_api_key", "")
         return result
 
     def save_config(self, value):
@@ -189,12 +193,13 @@ class Store:
                    "check_hours", "retry_minutes", "max_attempts", "search_limit", "log_days", "mini_enabled", "theme",
                    "cd2_mode", "cd2_host", "cd2_port", "cd2_root", "cd2_api_root"}
         allowed.update({"p115_api_interval_seconds", "cd2_api_interval_seconds", "transfer_interval_seconds"})
-        allowed.update({"transfer_timeout_seconds","distributed_transfer_enabled"})
+        allowed.update({"transfer_timeout_seconds","distributed_transfer_enabled","tmdb_enabled"})
         for key in allowed:
             if key in value: self.set(key, value[key])
         if value.get("bot_token"): self.set("bot_token", str(value["bot_token"]).strip(), True)
         if value.get("source_cookie"): self.set("source_cookie", str(value["source_cookie"]).strip(), True)
         if value.get("cd2_api_token"): self.set("cd2_api_token", str(value["cd2_api_token"]).strip(), True)
+        if value.get("tmdb_api_key"): self.set("tmdb_api_key", str(value["tmdb_api_key"]).strip(), True)
 
     def upsert_user(self, tg_id, username="", name=""):
         stamp = now()
@@ -511,6 +516,9 @@ class Telegram:
             payload["reply_markup"] = dumps({"inline_keyboard": [[{"text": "打开订阅中心", "web_app": {"url": url}}]]})
         return self.call("sendMessage", payload)
 
+    def send_photo(self, chat_id, photo, caption):
+        return self.call("sendPhoto", {"chat_id": str(chat_id), "photo": photo, "caption": caption, "parse_mode": "HTML"})
+
     def loop(self):
         while not self.app.stop.is_set():
             try:
@@ -557,6 +565,134 @@ class Telegram:
             self.send(sender["id"], "已暂停自动接收。")
         else:
             self.send(sender["id"], "可用命令：/start /status /all /pause")
+
+
+class TMDB:
+    API = "https://api.themoviedb.org/3"
+    WEB = "https://www.themoviedb.org"
+    IMAGE = "https://image.tmdb.org/t/p/w780"
+
+    @staticmethod
+    def request(api_key, path, params=None, timeout=15):
+        query = {"api_key": api_key, "language": "zh-CN", **(params or {})}
+        url = f"{TMDB.API}/{path.lstrip('/')}?{urllib.parse.urlencode(query)}"
+        request = urllib.request.Request(url, headers={"Accept": "application/json", "User-Agent": "CockroachRunner/1.0"})
+        with urllib.request.urlopen(request, timeout=timeout) as response:
+            return json.loads(response.read())
+
+    @staticmethod
+    def parse_name(filename, category=""):
+        stem = Path(str(filename)).stem
+        explicit = re.search(r"\{tmdb[-_: ]?(\d+)\}", stem, re.I)
+        episode = re.search(r"(?<![A-Za-z0-9])S(\d{1,2})E(\d{1,3})(?!\d)", stem, re.I)
+        year_match = re.search(r"(?<!\d)((?:19|20)\d{2})(?!\d)", stem)
+        media_type = "tv" if episode or str(category) in {"剧集", "电视剧", "综艺", "动漫"} else "movie"
+        title = stem[:episode.start()] if episode else stem
+        title = re.sub(r"\{(?:tmdb|imdb)[^}]*\}", " ", title, flags=re.I)
+        title = re.sub(r"[\[(（]?(?:19|20)\d{2}[\])）]?", " ", title)
+        title = re.split(r"(?i)(?:\b(?:2160p|1080p|720p|4k|8k|web[- .]?dl|bluray|blu[- .]?ray|remux|hdtv)\b)", title, maxsplit=1)[0]
+        title = re.sub(r"[._]+", " ", title)
+        title = re.sub(r"\s*[-–—]+\s*$", "", title)
+        title = re.sub(r"\s+", " ", title).strip(" -–—[]()（）")
+        return {"title": title or stem, "year": int(year_match.group(1)) if year_match else 0,
+                "media_type": media_type, "tmdb_id": int(explicit.group(1)) if explicit else 0,
+                "season": int(episode.group(1)) if episode else 0, "episode": int(episode.group(2)) if episode else 0}
+
+    @staticmethod
+    def detail(api_key, media_type, tmdb_id):
+        data = TMDB.request(api_key, f"{media_type}/{int(tmdb_id)}", {"append_to_response": "credits,external_ids"})
+        data["media_type"] = media_type
+        return data
+
+    @staticmethod
+    def lookup(api_key, item):
+        parsed = TMDB.parse_name(item.get("name", ""), item.get("category", ""))
+        media_types = [parsed["media_type"], "movie" if parsed["media_type"] == "tv" else "tv"]
+        if parsed["tmdb_id"]:
+            for media_type in media_types:
+                try: return TMDB.detail(api_key, media_type, parsed["tmdb_id"])
+                except urllib.error.HTTPError as exc:
+                    if exc.code != 404: raise
+            return None
+        params = {"query": parsed["title"], "include_adult": "false"}
+        if parsed["year"]:
+            params["first_air_date_year" if parsed["media_type"] == "tv" else "year"] = parsed["year"]
+        result = TMDB.request(api_key, f"search/{parsed['media_type']}", params)
+        matches = result.get("results") or []
+        if not matches: return None
+        return TMDB.detail(api_key, parsed["media_type"], matches[0]["id"])
+
+    @staticmethod
+    def size_text(size):
+        value = max(0, int(size or 0))
+        units = ("B", "KB", "MB", "GB", "TB")
+        amount = float(value)
+        for unit in units:
+            if amount < 1024 or unit == units[-1]: return f"{amount:.2f}{unit}" if unit != "B" else f"{int(amount)}B"
+            amount /= 1024
+
+    @staticmethod
+    def specifications(filename):
+        text = str(filename); upper = text.upper(); result=[]
+        if re.search(r"(?:2160P|\b4K\b)", upper): result.append("4K")
+        elif "1080P" in upper: result.append("1080P")
+        elif "720P" in upper: result.append("720P")
+        if re.search(r"DOLBY[ ._-]?VISION|\bDOVI\b|\bDV\b", upper): result.append("杜比视界")
+        elif "HDR10+" in upper: result.append("HDR10+")
+        elif "HDR10" in upper: result.append("HDR10")
+        elif "HDR" in upper: result.append("HDR")
+        elif "SDR" in upper: result.append("SDR")
+        if re.search(r"\b(?:HEVC|H[ .]?265|X265)\b", upper): result.append("HEVC")
+        elif re.search(r"\b(?:AVC|H[ .]?264|X264)\b", upper): result.append("AVC")
+        elif re.search(r"\bAV1\b", upper): result.append("AV1")
+        suffix=Path(text).suffix.lstrip(".").upper()
+        if suffix: result.append(suffix)
+        return result
+
+    @staticmethod
+    def region_category(metadata, kind):
+        countries = {str(item.get("iso_3166_1") or "") for item in metadata.get("production_countries") or []}
+        countries.update(str(code) for code in metadata.get("origin_country") or [])
+        if countries & {"CN","HK","TW","MO"}: region="华语"
+        elif countries & {"JP","KR"}: region="日韩"
+        elif countries & {"US","GB","CA","FR","DE","IT","ES","AU","NZ","IE"}: region="欧美"
+        else: region=""
+        return f"{region}{kind}"
+
+    @staticmethod
+    def caption(item, metadata):
+        media_type=metadata.get("media_type") or "movie"; kind="剧集" if media_type == "tv" else "电影"
+        title=str(metadata.get("name") or metadata.get("title") or TMDB.parse_name(item.get("name", ""))["title"])
+        date=str(metadata.get("first_air_date") or metadata.get("release_date") or "")
+        year=date[:4] if re.match(r"\d{4}",date) else str(TMDB.parse_name(item.get("name", ""))["year"] or "")
+        tmdb_id=int(metadata.get("id") or 0); tmdb_url=f"{TMDB.WEB}/{media_type}/{tmdb_id}?language=zh-CN"
+        rating=float(metadata.get("vote_average") or 0); category=TMDB.region_category(metadata,kind)
+        cast=(metadata.get("credits") or {}).get("cast") or []
+        actors=" / ".join(f'<a href="{TMDB.WEB}/person/{int(person["id"])}?language=zh-CN">{html.escape(str(person.get("name") or ""))}</a>' for person in cast[:4] if person.get("id") and person.get("name")) or "暂无资料"
+        specs=TMDB.specifications(item.get("name", "")); spec_text=" / ".join(specs) or "待识别"
+        short_name=str(item.get("name") or ""); short_name=short_name if len(short_name)<=90 else short_name[:87]+"…"
+        genres=[str(value.get("name") or "") for value in metadata.get("genres") or [] if value.get("name")][:3]
+        tag_title=re.sub(r"[^\w\u4e00-\u9fff]+","_",title).strip("_")[:30]
+        tags=[kind,tag_title,*specs[:3],*genres]
+        tag_line=" ".join("#"+re.sub(r"[^\w\u4e00-\u9fff]+","_",value).strip("_") for value in tags if value)
+        imdb=(metadata.get("external_ids") or {}).get("imdb_id") or metadata.get("imdb_id") or ""
+        parsed=TMDB.parse_name(item.get("name", ""),item.get("category", ""))
+        episode_line=f" · S{parsed['season']:02d}E{parsed['episode']:02d}" if parsed["season"] else ""
+        lines=[f"🎬 <b>{html.escape(title)}{(' · '+year) if year else ''}{episode_line}</b>","", "🎞 <b>影片资料</b>",
+               f"├ 类型 {kind}",f'├ TMDB ID <a href="{tmdb_url}">{tmdb_id}</a>',f"├ 分类 {html.escape(category)}",
+               f"├ 评分 {rating:.1f} / 10",f"├ 主演 {actors}","├ 接收方式 115 秒传",f"└ 大小 {TMDB.size_text(item.get('size',0))}","",
+               "🎥 <b>影音规格</b>",html.escape(spec_text),"", "📂 <b>文件列表 · 1 项</b>",f"1. <code>{html.escape(short_name)}</code>","",f"🏷 {html.escape(tag_line)}"]
+        if imdb: lines.extend(["",f'🎬 <a href="https://www.imdb.com/title/{urllib.parse.quote(str(imdb))}/">IMDb {html.escape(str(imdb))}</a>'])
+        overview=re.sub(r"\s+"," ",str(metadata.get("overview") or "")).strip()
+        if overview:
+            overview=overview if len(overview)<=260 else overview[:257]+"…"
+            lines.extend(["","📖 <b>剧情简介</b>",html.escape(overview)])
+        return "\n".join(lines)
+
+    @staticmethod
+    def poster(metadata):
+        path=str(metadata.get("poster_path") or "")
+        return TMDB.IMAGE+path if path.startswith("/") else ""
 
 
 class P115:
@@ -850,9 +986,40 @@ class Application:
         self.cd2_snapshots = {}
         self.qr_sessions = {}
         self.qr_lock = threading.Lock()
+        self.tmdb_cache = {}
+        self.tmdb_lock = threading.Lock()
         self.p115_gate = RateGate()
         self.cd2_gate = RateGate()
         self.transfer_gate = RateGate()
+
+    def tmdb_metadata(self, api_key, item):
+        cache_key=str(item.get("resource_id") or item.get("id") or item.get("name") or "")
+        with self.tmdb_lock:
+            cached=self.tmdb_cache.get(cache_key)
+            if cached and cached[0]>now(): return cached[1]
+        metadata=TMDB.lookup(api_key,item)
+        with self.tmdb_lock: self.tmdb_cache[cache_key]=(now()+21600,metadata)
+        return metadata
+
+    def notify_delivery_success(self,cfg,item):
+        fallback=f"✅ <b>派送完成</b>\n{html.escape(str(item['name']))}"
+        api_key=str(cfg.get("tmdb_api_key") or "")
+        if not cfg.get("tmdb_enabled") or not api_key:
+            return self.telegram.send(item["tg_id"],fallback,False)
+        try:
+            metadata=self.tmdb_metadata(api_key,item)
+        except Exception as exc:
+            self.store.event("TMDB",f"{item['name']}：资料读取失败，已改用普通成功通知；{redact_sensitive_text(exc)}",item["id"])
+            return self.telegram.send(item["tg_id"],fallback,False)
+        if not metadata:
+            self.store.event("TMDB",f"{item['name']}：未匹配到影视资料，已改用普通成功通知",item["id"])
+            return self.telegram.send(item["tg_id"],fallback,False)
+        caption=TMDB.caption(item,metadata); poster=TMDB.poster(metadata)
+        if poster:
+            try: return self.telegram.send_photo(item["tg_id"],poster,caption)
+            except Exception as exc:
+                self.store.event("TMDB海报",f"{item['name']}：海报发送失败，已改为文字资料；{redact_sensitive_text(exc)}",item["id"])
+        return self.telegram.send(item["tg_id"],caption,False)
 
     @staticmethod
     def user_label(value):
@@ -1181,7 +1348,9 @@ class Application:
                 woken=self.store.wake_relay_retries(item["resource_id"],item["id"])
                 if woken:
                     self.store.event("接力唤醒",f"{target_label} 已接收成功，立即唤醒 {woken} 个错误任务：{item['name']}",item["id"])
-            self.telegram.send(item["tg_id"], f"✅ <b>派送完成</b>\n{item['name']}", False)
+            try: self.notify_delivery_success(cfg,item)
+            except Exception as notify_exc:
+                self.store.event("通知失败",f"{target_label}：{item['name']}；{redact_sensitive_text(notify_exc)}",item["id"])
         except Exception as exc:
             failed=now(); attempts=int(item.get("attempts") or 0)+1; max_attempts=max(1,min(50,int(cfg.get("max_attempts") or 5)))
             delay=max(1,int(cfg.get("retry_minutes") or 15))*60*min(16,2**max(0,attempts-1))
@@ -1298,6 +1467,11 @@ class Handler(BaseHTTPRequestHandler):
                 if value.get("action")=="revoke": self.app.store.binding_action(value); return self.send_json(200,{"message":"绑定码已撤销"})
                 result=self.app.store.create_binding(str(value.get("plan") or "month")); return self.send_json(200,{"message":"会员绑定码已创建",**result})
             if path == "/api/admin/test-bot" and method == "POST": self.admin(); info=self.app.telegram.call("getMe"); return self.send_json(200, {**self.app.store.status(), "message": f"Bot 连接正常：@{info.get('username','')}"})
+            if path == "/api/admin/test-tmdb" and method == "POST":
+                self.admin(); key=self.app.store.get("tmdb_api_key","")
+                if not key: raise ValueError("请先保存 TMDB API Key")
+                info=TMDB.detail(key,"movie",155)
+                return self.send_json(200,{"message":f"TMDB 连接正常：{info.get('title') or info.get('original_title') or info.get('id')}"})
             if path == "/api/admin/scan" and method == "POST": self.admin(); threading.Thread(target=self.app.scan,daemon=True).start(); return self.send_json(202, {**self.app.store.status(), "message": "扫描已启动"})
             if path == "/api/mini/me" and method == "GET": uid=self.mini(); return self.send_json(200, {"user": self.app.store.user(uid), "categories": ["电影","剧集","动漫","纪录片","其他"], "qr_apps": QR_LOGIN_APPS})
             if path == "/api/mini/overview" and method == "GET": uid=self.mini(); return self.send_json(200, self.app.store.mini_overview(uid))

@@ -107,6 +107,7 @@ function renderSettings(config = {}) {
   $('transferInterval').value = config.transfer_interval_seconds ?? 3
   $('transferTimeout').value = config.transfer_timeout_seconds ?? 300
   $('distributedTransfer').checked = Boolean(config.distributed_transfer_enabled)
+  $('tmdbEnabled').checked = Boolean(config.tmdb_enabled)
   $('enabled').checked = Boolean(config.enabled)
   $('miniEnabled').checked = config.mini_enabled !== false
   $('botToken').placeholder = config.bot_configured ? '已配置，留空表示不修改' : '尚未配置'
@@ -117,6 +118,7 @@ function renderSettings(config = {}) {
   $('cd2Port').value = config.cd2_port || 19798
   $('cd2ApiRoot').value = config.cd2_api_root || '/'
   $('cd2ApiToken').placeholder = config.cd2_token_configured ? '已配置，留空表示不修改' : '尚未配置'
+  $('tmdbApiKey').placeholder = config.tmdb_configured ? '已配置，留空表示不修改' : '尚未配置'
 }
 
 function renderUsers(users = []) {
@@ -400,6 +402,7 @@ $('save').addEventListener('click', () => perform(async () => {
     transfer_interval_seconds: Number($('transferInterval').value || 0),
     transfer_timeout_seconds: Number($('transferTimeout').value || 300),
     distributed_transfer_enabled: $('distributedTransfer').checked,
+    tmdb_enabled: $('tmdbEnabled').checked,
     enabled: $('enabled').checked,
     mini_enabled: $('miniEnabled').checked,
     cd2_mode: $('cd2Mode').value,
@@ -411,16 +414,23 @@ $('save').addEventListener('click', () => perform(async () => {
   if ($('botToken').value.trim()) config.bot_token = $('botToken').value.trim()
   if ($('sourceCookie').value.trim()) config.source_cookie = $('sourceCookie').value.trim()
   if ($('cd2ApiToken').value.trim()) config.cd2_api_token = $('cd2ApiToken').value.trim()
+  if ($('tmdbApiKey').value.trim()) config.tmdb_api_key = $('tmdbApiKey').value.trim()
   await api('/api/admin/config', 'PUT', config)
   $('botToken').value = ''
   $('sourceCookie').value = ''
   $('cd2ApiToken').value = ''
+  $('tmdbApiKey').value = ''
   await refresh(false)
 }, '服务设置已保存'))
 
 $('testBot').addEventListener('click', () => perform(async () => {
   const data = await api('/api/admin/test-bot', 'POST')
   message(data.message || 'Bot 连接正常')
+}))
+
+$('testTmdb').addEventListener('click', () => perform(async () => {
+  const data = await api('/api/admin/test-tmdb', 'POST')
+  message(data.message || 'TMDB 连接正常')
 }))
 
 $('testCd2').addEventListener('click', () => perform(async () => {
