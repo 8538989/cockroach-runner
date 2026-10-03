@@ -14,6 +14,8 @@ const state = {
   overview: { deliveries: [], events: [], stats: { delivered: 0, pending: 0, failed: 0 } },
   saving: false,
   qr: null,
+  folder: null,
+  accountDraft: null,
 };
 let qrTimer = null;
 
@@ -122,6 +124,43 @@ async function bindAccount() {
     state.saving = false;
     render();
   }
+}
+
+async function loadMiniFolders() {
+  const current = state.folder.stack.at(-1);
+  state.folder.loading = true;
+  render();
+  try {
+    const data = await api(`/api/mini/browse?cid=${encodeURIComponent(current.id)}`);
+    state.folder.items = data.items || [];
+  } catch (error) {
+    toast(error.message);
+    state.folder = null;
+  } finally {
+    if (state.folder) state.folder.loading = false;
+    render();
+  }
+}
+
+function openMiniFolderPicker() {
+  state.accountDraft = accountValues();
+  state.folder = {stack: [{id: "0", name: "根目录"}], items: [], loading: false};
+  loadMiniFolders();
+}
+
+function enterMiniFolder(index) {
+  const item = state.folder?.items?.[index];
+  if (!item) return;
+  state.folder.stack.push({id: item.cid, name: item.name});
+  loadMiniFolders();
+}
+
+function chooseMiniFolder() {
+  const selected = state.folder.stack.at(-1);
+  state.accountDraft = {target_cid: selected.id, target_name: selected.name};
+  state.folder = null;
+  render();
+  toast("接收文件夹已选择，保存或扫码绑定后生效");
 }
 
 async function startQrLogin() {
@@ -253,6 +292,7 @@ function records() {
 
 function account() {
   const user = state.profile;
+  const target = state.accountDraft || {target_cid: user.target_cid || "0", target_name: user.target_name || "根目录"};
   const qrLabels = { waiting: "等待扫码", scanned: "已扫码，请在 115 确认", expired: "二维码已过期", error: "查询失败" };
   const selectedQrApp = state.qr?.app || "alipaymini";
   return shell(`<section class="panel">
@@ -268,8 +308,14 @@ function account() {
     <div class="section-head"><h2>115 账号</h2><span class="badge ${user.account_bound ? "green" : "gray"}">${user.account_bound ? "已加密保存" : "未填写"}</span></div>
     <p class="muted">Cookie 只保存在服务器端，用于把匹配到的资源派送到你的 115 目录。</p>
     <label class="field"><span>115 Cookie</span><textarea id="cookie" rows="4" placeholder="UID=...; CID=...; SEID=...; KID=..."></textarea></label>
-    <label class="field"><span>目标目录 CID</span><input id="cid" value="${esc(user.target_cid || "0")}"></label>
-    <label class="field"><span>目标目录名称</span><input id="target" value="${esc(user.target_name || "根目录")}"></label>
+    <label class="field"><span>目标目录 CID</span><input id="cid" value="${esc(target.target_cid)}"></label>
+    <label class="field"><span>目标目录名称</span><input id="target" value="${esc(target.target_name)}"></label>
+    <button class="secondary full compact" data-folder-open>从 115 网盘选择接收文件夹</button>
+    ${state.folder ? `<div class="mini-folder-picker">
+      <div class="mini-folder-head"><button class="text-button" data-folder-back ${state.folder.stack.length <= 1 ? "disabled" : ""}>返回</button><strong>${esc(state.folder.stack.map(item => item.name).join(" / "))}</strong><button class="text-button" data-folder-close>关闭</button></div>
+      ${state.folder.loading ? '<div class="folder-loading">正在读取...</div>' : state.folder.items.length ? state.folder.items.map((item, index) => `<button class="mini-folder-entry" data-folder-enter="${index}">📁 ${esc(item.name)}</button>`).join("") : '<div class="folder-loading">没有子文件夹</div>'}
+      <button class="primary full" data-folder-select>选择当前文件夹</button>
+    </div>` : ""}
     <label class="field"><span>扫码登录端</span><select id="qrApp" ${state.qr && !["expired","error"].includes(state.qr.status) ? "disabled" : ""}>${Object.entries(state.qrApps).map(([value, label]) => `<option value="${esc(value)}" ${selectedQrApp === value ? "selected" : ""}>${esc(label)}</option>`).join("")}</select></label>
     <button class="primary full" data-qr-start ${state.saving ? "disabled" : ""}>${state.saving ? "正在生成..." : "扫码获取 CK"}</button>
     ${state.qr ? `<div class="qr-card">
@@ -306,6 +352,11 @@ function bind() {
   root.querySelector("[data-save]")?.addEventListener("click", savePreferences);
   root.querySelector("[data-bind]")?.addEventListener("click", bindAccount);
   root.querySelectorAll("[data-qr-start]").forEach((node) => node.addEventListener("click", startQrLogin));
+  root.querySelector("[data-folder-open]")?.addEventListener("click", openMiniFolderPicker);
+  root.querySelector("[data-folder-close]")?.addEventListener("click", () => { state.folder = null; render(); });
+  root.querySelector("[data-folder-back]")?.addEventListener("click", () => { if (state.folder.stack.length > 1) state.folder.stack.pop(); loadMiniFolders(); });
+  root.querySelector("[data-folder-select]")?.addEventListener("click", chooseMiniFolder);
+  root.querySelectorAll("[data-folder-enter]").forEach((node) => node.addEventListener("click", () => enterMiniFolder(Number(node.dataset.folderEnter))));
   root.querySelectorAll("[data-refresh]").forEach((node) => node.addEventListener("click", async () => {
     try {
       await load();

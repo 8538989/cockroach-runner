@@ -2,6 +2,7 @@ const $ = id => document.getElementById(id)
 const dashboard = $('dashboard')
 let overview = null
 let toastTimer
+let folderPicker = null
 
 const labels = {
   active: '正常', disabled: '停用', valid: '有效', invalid: '失效', missing: '未绑定',
@@ -91,6 +92,12 @@ function renderSettings(config = {}) {
   $('miniEnabled').checked = config.mini_enabled !== false
   $('botToken').placeholder = config.bot_configured ? '已配置，留空表示不修改' : '尚未配置'
   $('sourceCookie').placeholder = config.source_configured ? '已配置，留空表示不修改' : '尚未配置'
+  $('cd2Mode').value = config.cd2_mode || 'mount'
+  $('cd2Root').value = config.cd2_root || '/cd2/miaochuang'
+  $('cd2Host').value = config.cd2_host || '127.0.0.1'
+  $('cd2Port').value = config.cd2_port || 19798
+  $('cd2ApiRoot').value = config.cd2_api_root || '/'
+  $('cd2ApiToken').placeholder = config.cd2_token_configured ? '已配置，留空表示不修改' : '尚未配置'
 }
 
 function renderUsers(users = []) {
@@ -139,7 +146,7 @@ function retentionText(minutes) {
 }
 
 function renderSources(items = []) {
-  const monitorLabels = {api_poll: '115 API 轮询', cd2_realtime: 'CD2 实时', cd2_poll: 'CD2 轮询'}
+  const monitorLabels = {api_poll: '115 API 轮询', cd2_realtime: 'CD2 本地实时', cd2_poll: 'CD2 本地轮询', cd2_api: 'CD2 API 轮询'}
   $('sourcesList').innerHTML = items.length ? items.map(item => `<article class="source-card">
     <div class="source-title"><div><strong>${escapeHtml(item.name)}</strong><small>CID ${escapeHtml(item.cid)} · ${escapeHtml(monitorLabels[item.monitor_type] || '115 API 轮询')}</small>${item.cd2_path ? `<small>${escapeHtml(item.cd2_path)}</small>` : ''}</div>${badge(item.enabled ? 'active' : 'disabled')}</div>
     <dl><div><dt>扫描间隔</dt><dd>${item.monitor_type === 'cd2_realtime' ? '约 2 秒' : `${escapeHtml(item.poll_seconds)} 秒`}</dd></div><div><dt>稳定等待</dt><dd>${escapeHtml(item.stable_seconds)} 秒</dd></div><div><dt>派送后删除</dt><dd>${escapeHtml(retentionText(item.retention_minutes))}</dd></div><div><dt>进入目录后删除</dt><dd>${escapeHtml(retentionText(item.age_delete_minutes))}</dd></div><div><dt>基线 / 新增</dt><dd>${escapeHtml(item.historical || 0)} / ${escapeHtml(item.added || 0)}</dd></div></dl>
@@ -240,7 +247,7 @@ function openSource(id = '') {
   $('sourceName').value = source?.name || ''
   $('sourceCid').value = source?.cid || '0'
   $('sourceMonitorType').value = source?.monitor_type || 'api_poll'
-  $('sourceCd2Path').value = source?.cd2_path || '/cd2/miaochuang'
+  $('sourceCd2Path').value = source?.cd2_path || overview?.config?.cd2_root || '/cd2/miaochuang'
   $('sourcePoll').value = source?.poll_seconds ?? 60
   $('sourceStable').value = source?.stable_seconds ?? 30
   setRetentionOption(source?.retention_minutes ?? -1)
@@ -250,6 +257,32 @@ function openSource(id = '') {
   ageSelect.value = ageValue
   $('sourceEnabled').checked = source ? Boolean(source.enabled) : true
   $('sourceDialog').showModal()
+}
+
+async function loadFolderLevel() {
+  const current = folderPicker.stack.at(-1)
+  let path
+  if (folderPicker.provider === '115') {
+    const params = new URLSearchParams({provider: folderPicker.adminUser ? 'user115' : '115', cid: current.id})
+    if (folderPicker.adminUser) params.set('tg_id', folderPicker.adminUser)
+    path = `/api/admin/browse?${params}`
+  } else {
+    path = `/api/admin/browse?${new URLSearchParams({provider: 'cd2', mode: folderPicker.mode, path: current.id})}`
+  }
+  $('folderPath').textContent = folderPicker.stack.map(item => item.name).join(' / ') || '/'
+  $('folderList').innerHTML = '<div class="folder-empty">正在读取...</div>'
+  const data = await api(path)
+  $('folderList').innerHTML = data.items.length ? data.items.map((item, index) => `<button type="button" class="folder-entry" data-folder-index="${index}">${escapeHtml(item.name)}</button>`).join('') : '<div class="folder-empty">这个文件夹内没有子文件夹</div>'
+  folderPicker.items = data.items
+  $('folderBack').disabled = folderPicker.stack.length <= 1
+}
+
+async function openFolderPicker(options) {
+  const rootId = options.provider === '115' ? '0' : (options.mode === 'api' ? (overview?.config?.cd2_api_root || '/') : (overview?.config?.cd2_root || '/cd2/miaochuang'))
+  folderPicker = {...options, stack: [{id: rootId, name: options.provider === '115' ? '根目录' : rootId}], items: []}
+  $('folderTitle').textContent = options.title || '选择文件夹'
+  $('folderDialog').showModal()
+  try { await loadFolderLevel() } catch (error) { $('folderDialog').close(); message(error.message, true) }
 }
 
 document.querySelectorAll('.tab').forEach(button => button.addEventListener('click', () => {
@@ -288,12 +321,19 @@ $('save').addEventListener('click', () => perform(async () => {
     default_category: $('defaultCategory').value.trim() || '其他',
     enabled: $('enabled').checked,
     mini_enabled: $('miniEnabled').checked,
+    cd2_mode: $('cd2Mode').value,
+    cd2_root: $('cd2Root').value.trim() || '/cd2/miaochuang',
+    cd2_host: $('cd2Host').value.trim() || '127.0.0.1',
+    cd2_port: Number($('cd2Port').value || 19798),
+    cd2_api_root: $('cd2ApiRoot').value.trim() || '/',
   }
   if ($('botToken').value.trim()) config.bot_token = $('botToken').value.trim()
   if ($('sourceCookie').value.trim()) config.source_cookie = $('sourceCookie').value.trim()
+  if ($('cd2ApiToken').value.trim()) config.cd2_api_token = $('cd2ApiToken').value.trim()
   await api('/api/admin/config', 'PUT', config)
   $('botToken').value = ''
   $('sourceCookie').value = ''
+  $('cd2ApiToken').value = ''
   await refresh(false)
 }, '服务设置已保存'))
 
@@ -301,6 +341,45 @@ $('testBot').addEventListener('click', () => perform(async () => {
   const data = await api('/api/admin/test-bot', 'POST')
   message(data.message || 'Bot 连接正常')
 }))
+
+$('testCd2').addEventListener('click', () => perform(async () => {
+  const data = await api('/api/admin/test-cd2', 'POST')
+  message(data.message || 'CD2 连接正常')
+}))
+
+$('pickSource115').addEventListener('click', () => openFolderPicker({provider: '115', title: '选择 115 监听目录', onSelect: folder => {
+  $('sourceCid').value = folder.id
+  $('sourceName').value ||= folder.name
+}}))
+$('pickSourceCd2').addEventListener('click', () => {
+  const mode = $('sourceMonitorType').value === 'cd2_api' ? 'api' : 'mount'
+  openFolderPicker({provider: 'cd2', mode, title: `选择 CD2 ${mode === 'api' ? 'API' : '挂载'}目录`, onSelect: folder => {
+    $('sourceCd2Path').value = folder.id
+    $('sourceName').value ||= folder.name
+  }})
+})
+$('pickUser115').addEventListener('click', () => openFolderPicker({provider: '115', adminUser: $('userTgId').value, title: '选择用户接收目录', onSelect: folder => {
+  $('userTargetCid').value = folder.id
+  $('userTargetName').value = folder.name
+}}))
+$('closeFolder').addEventListener('click', () => $('folderDialog').close())
+$('folderBack').addEventListener('click', () => {
+  if (folderPicker?.stack.length > 1) folderPicker.stack.pop()
+  perform(loadFolderLevel)
+})
+$('folderList').addEventListener('click', event => {
+  const button = event.target.closest('[data-folder-index]')
+  if (!button || !folderPicker) return
+  const item = folderPicker.items[Number(button.dataset.folderIndex)]
+  folderPicker.stack.push({id: item.cid || item.path, name: item.name})
+  perform(loadFolderLevel)
+})
+$('selectFolder').addEventListener('click', () => {
+  if (!folderPicker) return
+  const selected = folderPicker.stack.at(-1)
+  folderPicker.onSelect(selected)
+  $('folderDialog').close()
+})
 
 $('scan').addEventListener('click', () => perform(async () => {
   const data = await api('/api/admin/scan', 'POST')

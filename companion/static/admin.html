@@ -75,6 +75,12 @@
           <label class="field"><span>Telegram Bot Token</span><input id="botToken" type="password" placeholder="留空表示不修改"></label>
           <label class="field"><span>小程序 HTTPS 公网地址</span><input id="publicUrl" type="url" placeholder="https://example.com"></label>
           <label class="field wide"><span>源 115 Cookie</span><textarea id="sourceCookie" rows="3" placeholder="留空表示不修改"></textarea></label>
+          <label class="field"><span>CD2 接入方式</span><select id="cd2Mode"><option value="mount">本地挂载</option><option value="api">CD2 API（gRPC）</option></select></label>
+          <label class="field"><span>CD2 挂载根目录（容器内）</span><input id="cd2Root" placeholder="/cd2/miaochuang"></label>
+          <label class="field"><span>CD2 API 主机 / IP</span><input id="cd2Host" placeholder="127.0.0.1"></label>
+          <label class="field"><span>CD2 API 端口</span><input id="cd2Port" type="number" min="1" max="65535" value="19798"></label>
+          <label class="field"><span>CD2 API 根目录</span><input id="cd2ApiRoot" placeholder="/"></label>
+          <label class="field"><span>CD2 API Token</span><input id="cd2ApiToken" type="password" placeholder="留空表示不修改"></label>
           <label class="field"><span>派送并发数</span><input id="concurrency" type="number" min="1" max="10"></label>
           <label class="field"><span>CK 检查周期（小时）</span><input id="checkHours" type="number" min="1" max="168"></label>
           <label class="field"><span>失败重试间隔（分钟）</span><input id="retryMinutes" type="number" min="1" max="1440"></label>
@@ -84,7 +90,7 @@
           <label class="field"><span>默认分类</span><input id="defaultCategory"></label>
         </div>
         <div class="checks"><label class="check"><input id="enabled" type="checkbox"> 启用自动扫描与派送</label><label class="check"><input id="miniEnabled" type="checkbox"> 启用 Telegram 小程序</label></div>
-        <div class="actions"><button id="save" class="primary">保存设置</button><button id="testBot">测试 Bot</button><button id="scan">立即扫描</button></div>
+        <div class="actions"><button id="save" class="primary">保存设置</button><button id="testBot">测试 Bot</button><button id="testCd2">测试 CD2</button><button id="scan">立即扫描</button></div>
       </section>
 
       <section id="eventsPanel" class="panel">
@@ -104,7 +110,7 @@
       <div class="grid">
         <label class="field"><span>状态</span><select id="userStatus"><option value="active">正常</option><option value="disabled">停用</option></select></label>
         <label class="field"><span>搜索额度</span><input id="userSearchLimit" type="number" min="1" max="1000"></label>
-        <label class="field"><span>目标目录 CID</span><input id="userTargetCid"></label>
+        <label class="field"><span>目标目录 CID</span><div class="input-action"><input id="userTargetCid"><button type="button" id="pickUser115">选择文件夹</button></div></label>
         <label class="field"><span>目标目录名称</span><input id="userTargetName"></label>
         <label class="field"><span>订阅模式</span><select id="userMode"><option value="all">全部资源</option><option value="category">指定分类</option><option value="keyword">关键词</option></select></label>
         <label class="field"><span>分类（逗号分隔）</span><input id="userCategories"></label>
@@ -123,9 +129,10 @@
       <input id="sourceId" type="hidden">
       <div class="grid">
         <label class="field"><span>名称</span><input id="sourceName" required></label>
-        <label class="field"><span>目录 CID</span><input id="sourceCid" required></label>
-        <label class="field"><span>监听方式</span><select id="sourceMonitorType"><option value="api_poll">115 API 轮询</option><option value="cd2_realtime">CD2 实时监控（约 2 秒）</option><option value="cd2_poll">CD2 定时轮询</option></select></label>
+        <label class="field"><span>目录 CID</span><div class="input-action"><input id="sourceCid" required><button type="button" id="pickSource115">选择 115 文件夹</button></div></label>
+        <label class="field"><span>监听方式</span><select id="sourceMonitorType"><option value="api_poll">115 API 轮询</option><option value="cd2_realtime">CD2 本地实时监控（约 2 秒）</option><option value="cd2_poll">CD2 本地定时轮询</option><option value="cd2_api">CD2 API 轮询</option></select></label>
         <label class="field"><span>CD2 目录（容器内）</span><input id="sourceCd2Path" placeholder="/cd2/miaochuang/子目录"></label>
+        <div class="field"><span>CD2 目录选择</span><button type="button" id="pickSourceCd2">从 CD2 选择文件夹</button></div>
         <label class="field"><span>扫描间隔（秒）</span><input id="sourcePoll" type="number" min="15" max="3600" value="60"></label>
         <label class="field"><span>稳定等待（秒）</span><input id="sourceStable" type="number" min="0" max="86400" value="30"></label>
         <label class="field wide"><span>秒传成功后删除源文件</span><select id="sourceRetention"><option value="-1">永久保留（默认）</option><option value="0">立即删除</option><option value="10">10 分钟后</option><option value="60">1 小时后</option><option value="1440">1 天后</option><option value="10080">7 天后</option></select></label>
@@ -134,6 +141,13 @@
       <label class="check"><input id="sourceEnabled" type="checkbox" checked> 启用监听</label>
       <div class="dialog-actions"><button type="button" class="close-dialog">取消</button><button type="submit" class="primary">保存目录</button></div>
     </form>
+  </dialog>
+
+  <dialog id="folderDialog">
+    <div class="dialog-head"><h2 id="folderTitle">选择文件夹</h2><button type="button" class="icon-button" id="closeFolder" aria-label="关闭">×</button></div>
+    <div class="folder-toolbar"><button type="button" id="folderBack">返回上级</button><code id="folderPath">/</code></div>
+    <div id="folderList" class="folder-list"></div>
+    <div class="dialog-actions"><button type="button" id="selectFolder" class="primary">选择当前文件夹</button></div>
   </dialog>
 
   <script type="module" src="/admin.js"></script>

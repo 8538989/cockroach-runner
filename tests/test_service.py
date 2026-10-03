@@ -158,6 +158,7 @@ class ScanTests(unittest.TestCase):
             watched = Path(data_dir) / "watched"
             watched.mkdir()
             (watched / "New.mkv").touch()
+            store.set("cd2_root", data_dir)
             with store.db:
                 store.db.execute("UPDATE sources SET baseline_ready=1,monitor_type='cd2_realtime',cd2_path=?,stable_seconds=30 WHERE id='legacy'", (str(watched),))
             app = service.Application(store)
@@ -220,6 +221,34 @@ class ScanTests(unittest.TestCase):
             app = service.Application(store)
             with self.assertRaisesRegex(ValueError, "不支持"):
                 app.qr_start(123, {"app": "unknown-device"})
+            store.db.close()
+
+    def test_folder_browser_only_returns_115_directories(self):
+        entries = [
+            {"node_id": "10", "name": "Movies", "is_dir": True},
+            {"node_id": "11", "name": "readme.txt", "is_dir": False},
+        ]
+        original_list = service.P115.list_dir
+        try:
+            service.P115.list_dir = staticmethod(lambda cookie, cid: entries)
+            self.assertEqual(service.Application.folders_115("cookie", "0"), [{"name": "Movies", "cid": "10", "is_dir": True}])
+        finally:
+            service.P115.list_dir = original_list
+
+    def test_cd2_mount_browser_stays_inside_configured_root(self):
+        with tempfile.TemporaryDirectory() as root:
+            Path(root, "folder").mkdir()
+            items = service.CD2.list_mount({"cd2_root": root}, root)
+            self.assertEqual([(item["name"], item["is_dir"]) for item in items], [("folder", True)])
+            with self.assertRaisesRegex(ValueError, "超出"):
+                service.CD2.list_mount({"cd2_root": root}, str(Path(root).parent))
+
+    def test_cd2_api_source_accepts_remote_path_without_local_mount(self):
+        with tempfile.TemporaryDirectory() as data_dir:
+            store = service.Store(data_dir, Fernet.generate_key().decode())
+            sid = store.save_source({"name": "API", "cid": "123", "monitor_type": "cd2_api", "cd2_path": "/cloud/watch"})
+            source = next(item for item in store.sources() if item["id"] == sid)
+            self.assertEqual((source["monitor_type"], source["cd2_path"]), ("cd2_api", "/cloud/watch"))
             store.db.close()
 
 

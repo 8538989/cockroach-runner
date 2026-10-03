@@ -131,19 +131,30 @@ class Store:
             "theme": self.get("theme", "dark"),
             "bot_configured": bool(self.get("bot_token", "")),
             "source_configured": bool(self.get("source_cookie", "")),
+            "cd2_mode": self.get("cd2_mode", "mount"),
+            "cd2_host": self.get("cd2_host", "127.0.0.1"),
+            "cd2_port": self.get("cd2_port", 19798),
+            "cd2_root": self.get("cd2_root", "/cd2/miaochuang"),
+            "cd2_api_root": self.get("cd2_api_root", "/"),
+            "cd2_token_configured": bool(self.get("cd2_api_token", "")),
         }
         if include_secrets:
             result["bot_token"] = self.get("bot_token", "")
             result["source_cookie"] = self.get("source_cookie", "")
+            result["cd2_api_token"] = self.get("cd2_api_token", "")
         return result
 
     def save_config(self, value):
+        if "cd2_mode" in value and value["cd2_mode"] not in {"mount", "api"}: raise ValueError("CD2 接入方式无效")
+        if "cd2_port" in value: value["cd2_port"] = max(1, min(65535, int(value["cd2_port"])))
         allowed = {"public_url", "source_cid", "scan_seconds", "enabled", "default_category", "concurrency",
-                   "check_hours", "retry_minutes", "max_attempts", "search_limit", "log_days", "mini_enabled", "theme"}
+                   "check_hours", "retry_minutes", "max_attempts", "search_limit", "log_days", "mini_enabled", "theme",
+                   "cd2_mode", "cd2_host", "cd2_port", "cd2_root", "cd2_api_root"}
         for key in allowed:
             if key in value: self.set(key, value[key])
         if value.get("bot_token"): self.set("bot_token", str(value["bot_token"]).strip(), True)
         if value.get("source_cookie"): self.set("source_cookie", str(value["source_cookie"]).strip(), True)
+        if value.get("cd2_api_token"): self.set("cd2_api_token", str(value["cd2_api_token"]).strip(), True)
 
     def upsert_user(self, tg_id, username="", name=""):
         stamp = now()
@@ -217,14 +228,16 @@ class Store:
         retention = max(-1, min(525600, int(value.get("retention_minutes", -1))))
         age_delete = max(-1, min(525600, int(value.get("age_delete_minutes", -1))))
         monitor_type = str(value.get("monitor_type") or "api_poll")
-        if monitor_type not in {"api_poll", "cd2_realtime", "cd2_poll"}: raise ValueError("监听方式无效")
+        if monitor_type not in {"api_poll", "cd2_realtime", "cd2_poll", "cd2_api"}: raise ValueError("监听方式无效")
         cd2_path = str(value.get("cd2_path") or "").strip()
-        if monitor_type.startswith("cd2_"):
+        if monitor_type in {"cd2_realtime", "cd2_poll"}:
             resolved = Path(cd2_path).resolve()
-            cd2_root = Path("/cd2/miaochuang").resolve()
-            if resolved != cd2_root and cd2_root not in resolved.parents: raise ValueError("CD2 路径必须位于 /cd2/miaochuang 内")
+            cd2_root = Path(str(self.get("cd2_root", "/cd2/miaochuang"))).resolve()
+            if resolved != cd2_root and cd2_root not in resolved.parents: raise ValueError(f"CD2 路径必须位于 {cd2_root} 内")
             if not resolved.is_dir(): raise ValueError("CD2 监听目录不存在或容器无权访问")
             cd2_path = str(resolved)
+        elif monitor_type == "cd2_api":
+            if not cd2_path.startswith("/"): raise ValueError("CD2 API 目录必须是以 / 开头的网盘路径")
         with self.lock, self.db:
             self.db.execute("""INSERT INTO sources(id,name,cid,enabled,poll_seconds,stable_seconds,retention_minutes,monitor_type,cd2_path,age_delete_minutes,created,updated)
               VALUES(?,?,?,?,?,?,?,?,?,?,?,?) ON CONFLICT(id) DO UPDATE SET name=excluded.name,cid=excluded.cid,
@@ -585,6 +598,77 @@ class P115:
             raise RuntimeError((result or {}).get("error") or "删除源文件失败")
 
 
+class CD2:
+    @staticmethod
+    def _api_client(cfg):
+        try:
+            import grpc
+            from clouddrive2_client import CloudDriveClient
+        except ImportError as exc:
+            raise RuntimeError("当前镜像缺少 CloudDrive2 API 客户端") from exc
+        host = str(cfg.get("cd2_host") or "127.0.0.1").strip()
+        port = max(1, min(65535, int(cfg.get("cd2_port") or 19798)))
+        client = CloudDriveClient(f"{host}:{port}")
+        token = str(cfg.get("cd2_api_token") or "").strip()
+        if not token:
+            client.close()
+            raise RuntimeError("尚未配置 CD2 API Token")
+        client.jwt_token = token
+        try:
+            grpc.channel_ready_future(client.channel).result(timeout=8)
+        except Exception as exc:
+            client.close()
+            raise RuntimeError(f"无法连接 CD2 API：{host}:{port}") from exc
+        return client
+
+    @staticmethod
+    def _api_name(item):
+        full_path = str(getattr(item, "fullPathName", "") or "")
+        return str(getattr(item, "name", "") or getattr(item, "fileName", "") or Path(full_path.rstrip("/")).name)
+
+    @staticmethod
+    def list_api(cfg, path):
+        path = str(path or cfg.get("cd2_api_root") or "/").strip() or "/"
+        if not path.startswith("/"): raise ValueError("CD2 API 路径必须以 / 开头")
+        client = CD2._api_client(cfg)
+        try:
+            from clouddrive2_client.proto import clouddrive_pb2
+            request = clouddrive_pb2.ListSubFileRequest(path=path, forceRefresh=True)
+            metadata = client._create_authorized_metadata()
+            result = []
+            for response in client.stub.GetSubFiles(request, metadata=metadata, timeout=20):
+                for item in response.subFiles:
+                    name = CD2._api_name(item)
+                    full_path = str(getattr(item, "fullPathName", "") or "") or (path.rstrip("/") + "/" + name)
+                    is_dir = bool(getattr(item, "isDirectory", False))
+                    if name: result.append({"name": name, "path": full_path, "is_dir": is_dir})
+            return result
+        except Exception as exc:
+            raise RuntimeError(f"读取 CD2 API 目录失败：{exc}") from exc
+        finally:
+            client.close()
+
+    @staticmethod
+    def list_mount(cfg, path=""):
+        root = Path(str(cfg.get("cd2_root") or "/cd2/miaochuang")).resolve()
+        selected = Path(str(path or root)).resolve()
+        if selected != root and root not in selected.parents: raise ValueError("CD2 目录超出已配置的挂载根目录")
+        if not selected.is_dir(): raise RuntimeError("CD2 挂载目录不存在或容器无权访问")
+        return [{"name": item.name, "path": str(Path(item.path).resolve()), "is_dir": item.is_dir(follow_symlinks=False)} for item in os.scandir(selected)]
+
+    @staticmethod
+    def list_dir(cfg, path="", mode=None):
+        selected_mode = mode or str(cfg.get("cd2_mode") or "mount")
+        return CD2.list_api(cfg, path) if selected_mode == "api" else CD2.list_mount(cfg, path)
+
+    @staticmethod
+    def test(cfg):
+        mode = str(cfg.get("cd2_mode") or "mount")
+        path = cfg.get("cd2_api_root") if mode == "api" else cfg.get("cd2_root")
+        items = CD2.list_dir(cfg, path, mode)
+        return {"mode": mode, "path": path, "count": len(items)}
+
+
 def category_for(name, default):
     text = name.lower()
     if re.search(r"\b(s\d{1,2}e\d{1,3}|ep?\d{1,3}|第.{1,4}集)\b", text, re.I): return "剧集"
@@ -645,6 +729,33 @@ class Application:
         self.store.event("用户管理",f"扫码绑定115：{tg_id}",str(tg_id))
         return {"status":"confirmed","user":user,"account":profile}
 
+    @staticmethod
+    def folders_115(cookie, cid="0"):
+        if not cookie: raise RuntimeError("尚未配置可用的 115 Cookie")
+        folders = [entry for entry in P115.list_dir(cookie, str(cid or "0")) if entry["is_dir"]]
+        return [{"name": item["name"], "cid": item["node_id"], "is_dir": True} for item in folders]
+
+    def admin_browse(self, query):
+        provider = str(query.get("provider", ["115"])[0] or "115")
+        if provider == "115":
+            return {"provider": "115", "items": self.folders_115(self.store.get("source_cookie", ""), query.get("cid", ["0"])[0])}
+        if provider == "user115":
+            tg_id = int(query.get("tg_id", ["0"])[0] or 0)
+            user = self.store.user(tg_id, True)
+            if not user: raise ValueError("用户不存在")
+            return {"provider": "115", "items": self.folders_115(user.get("cookie", ""), query.get("cid", ["0"])[0])}
+        if provider == "cd2":
+            cfg = self.store.config(True)
+            mode = str(query.get("mode", [cfg.get("cd2_mode", "mount")])[0] or cfg.get("cd2_mode", "mount"))
+            path = str(query.get("path", [""])[0] or (cfg.get("cd2_api_root") if mode == "api" else cfg.get("cd2_root")))
+            return {"provider": "cd2", "mode": mode, "path": path, "items": [item for item in CD2.list_dir(cfg, path, mode) if item["is_dir"]]}
+        raise ValueError("不支持的目录来源")
+
+    def mini_browse(self, tg_id, query):
+        user = self.store.user(tg_id, True)
+        if not user: raise ValueError("用户不存在")
+        return {"provider": "115", "items": self.folders_115(user.get("cookie", ""), query.get("cid", ["0"])[0])}
+
     def scan(self, force=True):
         if not self.scan_lock.acquire(False): return
         try:
@@ -666,9 +777,9 @@ class Application:
         except Exception as exc: self.store.set("last_error", f"扫描：{exc}")
         finally: self.scan_lock.release()
 
-    def cd2_entries(self, source, force=False):
-        path = Path(source["cd2_path"])
-        entries = [item.name for item in os.scandir(path)]
+    def cd2_entries(self, cfg, source, force=False):
+        mode = "api" if source.get("monitor_type") == "cd2_api" else "mount"
+        entries = [item["name"] for item in CD2.list_dir(cfg, source["cd2_path"], mode)]
         snapshot = hashlib.sha256(dumps(sorted(entries)).encode()).hexdigest()
         previous = self.cd2_snapshots.get(source["id"])
         self.cd2_snapshots[source["id"]] = snapshot
@@ -679,7 +790,7 @@ class Application:
             monitor_type = source.get("monitor_type") or "api_poll"
             local_names = None
             if monitor_type.startswith("cd2_"):
-                local, changed = self.cd2_entries(source, force)
+                local, changed = self.cd2_entries(cfg, source, force)
                 if not changed:
                     stable_cutoff = stamp - int(source["stable_seconds"])
                     with self.store.lock:
@@ -846,7 +957,7 @@ class Handler(BaseHTTPRequestHandler):
     def do_DELETE(self): self.route("DELETE")
     def route(self, method):
         try:
-            path = urllib.parse.urlsplit(self.path).path
+            parsed = urllib.parse.urlsplit(self.path); path = parsed.path; query = urllib.parse.parse_qs(parsed.query)
             if path == "/healthz": return self.send_json(200, {"ok": True, "name": APP_NAME})
             if path == "/" or path == "/index.html": return self.send_file("index.html", "text/html; charset=utf-8")
             if path == "/admin" or path == "/admin.html": return self.send_file("admin.html", "text/html; charset=utf-8")
@@ -858,6 +969,8 @@ class Handler(BaseHTTPRequestHandler):
             if path == "/api/admin/status" and method == "GET": self.admin(); return self.send_json(200, self.app.store.status())
             if path == "/api/admin/overview" and method == "GET": self.admin(); return self.send_json(200, self.app.store.overview())
             if path == "/api/admin/config" and method == "PUT": self.admin(); self.app.store.save_config(self.body()); return self.send_json(200, {**self.app.store.status(), "message": "配置已保存"})
+            if path == "/api/admin/browse" and method == "GET": self.admin(); return self.send_json(200, self.app.admin_browse(query))
+            if path == "/api/admin/test-cd2" and method == "POST": self.admin(); result=CD2.test(self.app.store.config(True)); return self.send_json(200,{"message":f"CD2 连接正常，读取到 {result['count']} 个项目",**result})
             if path == "/api/admin/users" and method == "PUT":
                 self.admin(); value=self.body(); user=self.app.store.save_user(int(value.get("tg_id") or 0),value); self.app.store.event("用户管理",f"更新用户：{user.get('name') or user.get('tg_id')}",str(user["tg_id"])); return self.send_json(200,{"message":"用户设置已保存","user":user})
             if path == "/api/admin/users" and method == "DELETE":
@@ -874,6 +987,7 @@ class Handler(BaseHTTPRequestHandler):
             if path == "/api/admin/scan" and method == "POST": self.admin(); threading.Thread(target=self.app.scan,daemon=True).start(); return self.send_json(202, {**self.app.store.status(), "message": "扫描已启动"})
             if path == "/api/mini/me" and method == "GET": uid=self.mini(); return self.send_json(200, {"user": self.app.store.user(uid), "categories": ["电影","剧集","动漫","纪录片","其他"], "qr_apps": QR_LOGIN_APPS})
             if path == "/api/mini/overview" and method == "GET": uid=self.mini(); return self.send_json(200, self.app.store.mini_overview(uid))
+            if path == "/api/mini/browse" and method == "GET": uid=self.mini(); return self.send_json(200, self.app.mini_browse(uid,query))
             if path == "/api/mini/preferences" and method == "PUT": uid=self.mini(); return self.send_json(200, {"user": self.app.store.save_user(uid, self.body())})
             if path == "/api/mini/account" and method == "PUT":
                 uid=self.mini(); value=self.body(); profile=P115.profile(str(value.get("cookie") or "")); value["uid"]=profile["uid"]

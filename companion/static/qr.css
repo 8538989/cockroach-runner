@@ -7,3 +7,4 @@
 .field select{width:100%;border:1px solid var(--line);background:var(--surface);color:var(--ink);border-radius:11px;padding:11px 12px;min-width:0}
 .account-divider{display:flex;align-items:center;gap:10px;margin:18px 0 0;color:var(--muted);font-size:11px}
 .account-divider:before,.account-divider:after{content:'';height:1px;flex:1;background:var(--line)}
+.compact{margin-top:10px}.mini-folder-picker{margin-top:12px;padding:12px;border:1px solid var(--line);border-radius:13px;background:#f6f9fb}.mini-folder-head{display:flex;align-items:center;justify-content:space-between;gap:8px;margin-bottom:9px}.mini-folder-head strong{font-size:12px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}.mini-folder-entry{display:block;width:100%;text-align:left;border:0;border-bottom:1px solid var(--line);background:transparent;color:var(--ink);padding:11px 6px}.folder-loading{text-align:center;color:var(--muted);padding:22px 8px}
