@@ -10,6 +10,60 @@ import service  # noqa: E402
 
 
 class ScanTests(unittest.TestCase):
+    def test_source_can_use_its_own_encrypted_115_cookie(self):
+        with tempfile.TemporaryDirectory() as data_dir:
+            store = service.Store(data_dir, Fernet.generate_key().decode())
+            original_profile = service.P115.profile
+            try:
+                service.P115.profile = staticmethod(lambda cookie: {"uid": "source-user", "name": "Source"} if cookie == "SOURCE-CK" else {})
+                sid = store.save_source({"name": "独立账号目录", "cid": "88", "cookie_mode": "independent", "cookie": "SOURCE-CK"})
+                public = next(item for item in store.sources() if item["id"] == sid)
+                self.assertNotIn("cookie", public)
+                self.assertTrue(public["cookie_configured"])
+                self.assertTrue(store.config()["source_configured"])
+                self.assertEqual(store.source_cookie(sid, "GLOBAL-CK"), "SOURCE-CK")
+                store.save_source({"id": sid, "name": "独立账号目录", "cid": "88", "cookie_mode": "independent"})
+                self.assertEqual(store.source_cookie(sid, "GLOBAL-CK"), "SOURCE-CK")
+            finally:
+                service.P115.profile = original_profile
+                store.db.close()
+
+    def test_source_folder_browser_uses_typed_independent_cookie(self):
+        with tempfile.TemporaryDirectory() as data_dir:
+            store = service.Store(data_dir, Fernet.generate_key().decode())
+            store.set("p115_api_interval_seconds", 0)
+            seen = []
+            original_list = service.P115.list_dir
+            try:
+                service.P115.list_dir = staticmethod(lambda cookie, cid: seen.append((cookie, cid)) or [
+                    {"node_id": "9", "name": "Movies", "is_dir": True}
+                ])
+                result = service.Application(store).source_browse({"cookie_mode": "independent", "cookie": "NEW-CK", "cid": "7"})
+                self.assertEqual(seen, [("NEW-CK", "7")])
+                self.assertEqual(result["items"], [{"name": "Movies", "cid": "9", "is_dir": True}])
+            finally:
+                service.P115.list_dir = original_list
+                store.db.close()
+
+    def test_scan_uses_monitor_directory_independent_cookie(self):
+        with tempfile.TemporaryDirectory() as data_dir:
+            store = service.Store(data_dir, Fernet.generate_key().decode())
+            store.set("source_cookie", "GLOBAL-CK", True)
+            store.set("p115_api_interval_seconds", 0)
+            encrypted = store.crypt.encrypt(b"DIRECTORY-CK").decode()
+            with store.db:
+                store.db.execute("UPDATE sources SET cookie_mode='independent',cookie=?,baseline_ready=1,stable_seconds=0 WHERE id='legacy'", (encrypted,))
+            seen = []
+            original_list = service.P115.list_dir
+            try:
+                service.P115.list_dir = staticmethod(lambda cookie, cid: seen.append((cookie, cid)) or [])
+                source = store.sources(True)[0]
+                service.Application(store).scan_source(store.config(True), source, service.now(), True)
+                self.assertEqual(seen, [("DIRECTORY-CK", source["cid"])])
+            finally:
+                service.P115.list_dir = original_list
+                store.db.close()
+
     def test_bulk_delivery_actions_and_record_deletion(self):
         with tempfile.TemporaryDirectory() as data_dir:
             store = service.Store(data_dir, Fernet.generate_key().decode())

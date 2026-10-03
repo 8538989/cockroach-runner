@@ -103,6 +103,8 @@ class Store:
                 ("sources","monitor_type","TEXT NOT NULL DEFAULT 'api_poll'"),
                 ("sources","cd2_path","TEXT NOT NULL DEFAULT ''"),
                 ("sources","age_delete_minutes","INTEGER NOT NULL DEFAULT -1"),
+                ("sources","cookie","TEXT NOT NULL DEFAULT ''"),
+                ("sources","cookie_mode","TEXT NOT NULL DEFAULT 'global'"),
                 ("resources","hidden","INTEGER NOT NULL DEFAULT 0"),
                 ("users","membership_expires","INTEGER NOT NULL DEFAULT 0"),
                 ("users","membership_plan","TEXT NOT NULL DEFAULT ''"),
@@ -136,6 +138,7 @@ class Store:
         except (InvalidToken, ValueError, json.JSONDecodeError): return default
 
     def config(self, include_secrets=False):
+        with self.lock: independent_source_configured=bool(self.db.execute("SELECT 1 FROM sources WHERE cookie_mode='independent' AND cookie<>'' LIMIT 1").fetchone())
         result = {
             "public_url": self.get("public_url", ""),
             "source_cid": self.get("source_cid", "0"),
@@ -151,7 +154,7 @@ class Store:
             "mini_enabled": self.get("mini_enabled", True),
             "theme": self.get("theme", "dark"),
             "bot_configured": bool(self.get("bot_token", "")),
-            "source_configured": bool(self.get("source_cookie", "")),
+            "source_configured": bool(self.get("source_cookie", "")) or independent_source_configured,
             "cd2_mode": self.get("cd2_mode", "mount"),
             "cd2_host": self.get("cd2_host", "127.0.0.1"),
             "cd2_port": self.get("cd2_port", 19798),
@@ -243,8 +246,22 @@ class Store:
         with self.lock, self.db: self.db.execute(sql, (*fields.values(), tg_id))
         return self.user(tg_id)
 
-    def sources(self):
-        with self.lock: return [dict(row) for row in self.db.execute("SELECT * FROM sources ORDER BY created")]
+    def sources(self, include_cookie=False):
+        with self.lock: rows=[dict(row) for row in self.db.execute("SELECT * FROM sources ORDER BY created")]
+        for source in rows:
+            encrypted=source.get("cookie") or ""
+            source["cookie_configured"]=bool(encrypted)
+            if include_cookie:
+                try: source["cookie"]=self.crypt.decrypt(encrypted.encode()).decode() if encrypted else ""
+                except InvalidToken: source["cookie"]=""
+            else: source.pop("cookie",None)
+        return rows
+
+    def source_cookie(self, source_id, fallback=""):
+        with self.lock: row=self.db.execute("SELECT cookie_mode,cookie FROM sources WHERE id=?",(str(source_id),)).fetchone()
+        if not row or row["cookie_mode"] != "independent": return fallback
+        try: return self.crypt.decrypt(row["cookie"].encode()).decode() if row["cookie"] else ""
+        except InvalidToken: return ""
 
     def save_source(self, value):
         sid = str(value.get("id") or secrets.token_hex(10)); stamp = now()
@@ -256,6 +273,18 @@ class Store:
         age_delete = max(-1, min(525600, int(value.get("age_delete_minutes", -1))))
         monitor_type = str(value.get("monitor_type") or "api_poll")
         if monitor_type not in {"api_poll", "cd2_realtime", "cd2_poll", "cd2_api"}: raise ValueError("监听方式无效")
+        cookie_mode=str(value.get("cookie_mode") or "global")
+        if cookie_mode not in {"global","independent"}: raise ValueError("115 CK 使用方式无效")
+        raw_cookie=str(value.get("cookie") or "").strip()
+        with self.lock: current=self.db.execute("SELECT cookie FROM sources WHERE id=?",(sid,)).fetchone()
+        encrypted_cookie=str(current["cookie"] or "") if current else ""
+        if cookie_mode == "independent":
+            if raw_cookie:
+                profile=P115.profile(raw_cookie)
+                if not profile.get("uid"): raise ValueError("115 CK 验证失败")
+                encrypted_cookie=self.crypt.encrypt(raw_cookie.encode()).decode()
+            if not encrypted_cookie: raise ValueError("独立 CK 模式请先填写有效的 115 CK")
+        else: encrypted_cookie=""
         cd2_path = str(value.get("cd2_path") or "").strip()
         if monitor_type in {"cd2_realtime", "cd2_poll"}:
             resolved = Path(cd2_path).resolve()
@@ -266,12 +295,12 @@ class Store:
         elif monitor_type == "cd2_api":
             if not cd2_path.startswith("/"): raise ValueError("CD2 API 目录必须是以 / 开头的网盘路径")
         with self.lock, self.db:
-            self.db.execute("""INSERT INTO sources(id,name,cid,enabled,poll_seconds,stable_seconds,retention_minutes,monitor_type,cd2_path,age_delete_minutes,created,updated)
-              VALUES(?,?,?,?,?,?,?,?,?,?,?,?) ON CONFLICT(id) DO UPDATE SET name=excluded.name,cid=excluded.cid,
+            self.db.execute("""INSERT INTO sources(id,name,cid,enabled,poll_seconds,stable_seconds,retention_minutes,monitor_type,cd2_path,age_delete_minutes,cookie,cookie_mode,created,updated)
+              VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?) ON CONFLICT(id) DO UPDATE SET name=excluded.name,cid=excluded.cid,
               enabled=excluded.enabled,poll_seconds=excluded.poll_seconds,stable_seconds=excluded.stable_seconds,
               retention_minutes=excluded.retention_minutes,monitor_type=excluded.monitor_type,cd2_path=excluded.cd2_path,
-              age_delete_minutes=excluded.age_delete_minutes,updated=excluded.updated""",
-              (sid,name,cid,int(bool(value.get("enabled",True))),poll,stable,retention,monitor_type,cd2_path,age_delete,stamp,stamp))
+              age_delete_minutes=excluded.age_delete_minutes,cookie=excluded.cookie,cookie_mode=excluded.cookie_mode,updated=excluded.updated""",
+              (sid,name,cid,int(bool(value.get("enabled",True))),poll,stable,retention,monitor_type,cd2_path,age_delete,encrypted_cookie,cookie_mode,stamp,stamp))
         self.event("监听目录", f"保存监听目录：{name}", sid); return sid
 
     def source_action(self, value):
@@ -816,6 +845,14 @@ class Application:
             return {"provider": "cd2", "mode": mode, "path": path, "items": [item for item in CD2.list_dir(cfg, path, mode) if item["is_dir"]]}
         raise ValueError("不支持的目录来源")
 
+    def source_browse(self,value):
+        mode=str(value.get("cookie_mode") or "global")
+        if mode == "independent":
+            cookie=str(value.get("cookie") or "").strip()
+            if not cookie: cookie=self.store.source_cookie(str(value.get("source_id") or ""),"")
+        else: cookie=str(self.store.get("source_cookie","") or "")
+        return {"provider":"115","items":self.folders_115(cookie,str(value.get("cid") or "0"))}
+
     def mini_browse(self, tg_id, query):
         user = self.store.user(tg_id, True)
         if not user: raise ValueError("用户不存在")
@@ -825,9 +862,10 @@ class Application:
         if not self.scan_lock.acquire(False): return
         try:
             cfg = self.store.config(True)
-            if not cfg["source_configured"]: raise RuntimeError("尚未配置源115 Cookie")
+            sources=self.store.sources(True)
+            if not cfg["source_configured"]: raise RuntimeError("尚未配置源115 Cookie或监听目录独立 CK")
             stamp=now(); scanned=0; errors=[]
-            for source in self.store.sources():
+            for source in sources:
                 if not source["enabled"] or (not force and int(source["next_scan"] or 0)>stamp): continue
                 error=self.scan_source(cfg,source,stamp,force); scanned+=1
                 if error: errors.append(f"{source['name']}：{error}")
@@ -876,7 +914,7 @@ class Application:
         self.cd2_snapshots[source["id"]] = snapshot
         return entries, force or previous is None or snapshot != previous
 
-    def expand_source_videos(self, cfg, entries):
+    def expand_source_videos(self, cfg, entries, source_cookie):
         videos = []
         queue = list(entries)
         visited_dirs = 0
@@ -888,11 +926,13 @@ class Application:
             visited_dirs += 1
             if visited_dirs > 1000: raise RuntimeError("115 子目录数量超过 1000，已停止递归以避免 API 风控")
             self.p115_gate.wait(cfg.get("p115_api_interval_seconds", 1))
-            queue.extend(P115.list_dir(cfg["source_cookie"], entry["node_id"]))
+            queue.extend(P115.list_dir(source_cookie, entry["node_id"]))
         return videos
 
     def scan_source(self,cfg,source,stamp,force=False):
         try:
+            source_cookie=source.get("cookie") if source.get("cookie_mode")=="independent" else cfg["source_cookie"]
+            if not source_cookie: raise RuntimeError("该监听目录尚未配置可用的 115 CK")
             monitor_type = source.get("monitor_type") or "api_poll"
             local_names = None
             if monitor_type.startswith("cd2_"):
@@ -908,9 +948,9 @@ class Application:
                         return ""
                 local_names = set(local)
             self.p115_gate.wait(cfg.get("p115_api_interval_seconds", 1))
-            entries=P115.list_dir(cfg["source_cookie"],source["cid"])
+            entries=P115.list_dir(source_cookie,source["cid"])
             if local_names is not None: entries = [entry for entry in entries if entry["name"] in local_names]
-            entries=self.expand_source_videos(cfg,entries)
+            entries=self.expand_source_videos(cfg,entries,source_cookie)
             discovered=0
             with self.store.lock,self.store.db:
                 baseline=bool(source["baseline_ready"])
@@ -982,7 +1022,9 @@ class Application:
             with self.store.lock, self.store.db:
                 started=self.store.db.execute("UPDATE deliveries SET status='running',attempts=attempts+1,updated=? WHERE id=? AND status IN ('waiting','retry')", (now(), item["id"])).rowcount
             if not started: return
-            P115.transfer(cfg["source_cookie"], cookie, item, item["target_cid"])
+            source_cookie=self.store.source_cookie(item["source_id"],cfg["source_cookie"])
+            if not source_cookie: raise RuntimeError("资源所属监听目录没有可用的 115 CK")
+            P115.transfer(source_cookie, cookie, item, item["target_cid"])
             done=now()
             with self.store.lock, self.store.db:
                 current=self.store.db.execute("SELECT status FROM deliveries WHERE id=?",(item["id"],)).fetchone()
@@ -1011,7 +1053,9 @@ class Application:
             item=dict(row)
             try:
                 self.p115_gate.wait(cfg.get("p115_api_interval_seconds", 1))
-                P115.delete(cfg["source_cookie"],item["node_id"])
+                source_cookie=self.store.source_cookie(item["source_id"],cfg["source_cookie"])
+                if not source_cookie: raise RuntimeError("资源所属监听目录没有可用的 115 CK")
+                P115.delete(source_cookie,item["node_id"])
                 with self.store.lock,self.store.db: self.store.db.execute("UPDATE resources SET cleanup='deleted',status='deleted',cleanup_error='' WHERE id=?",(item["id"],))
                 self.store.event("清理",f"秒传后删除源文件：{item['name']}",item["id"])
             except Exception as exc:
@@ -1086,6 +1130,7 @@ class Handler(BaseHTTPRequestHandler):
                 self.admin(); return self.send_json(200,self.app.store.records_page(str(query.get("type",[""])[0]),query.get("page",[1])[0],query.get("page_size",[100])[0]))
             if path == "/api/admin/config" and method == "PUT": self.admin(); self.app.store.save_config(self.body()); return self.send_json(200, {**self.app.store.status(), "message": "配置已保存"})
             if path == "/api/admin/browse" and method == "GET": self.admin(); return self.send_json(200, self.app.admin_browse(query))
+            if path == "/api/admin/source-browse" and method == "POST": self.admin(); return self.send_json(200,self.app.source_browse(self.body()))
             if path == "/api/admin/test-cd2" and method == "POST": self.admin(); result=CD2.test(self.app.store.config(True)); return self.send_json(200,{"message":f"CD2 连接正常，读取到 {result['count']} 个项目",**result})
             if path == "/api/admin/users" and method == "PUT":
                 self.admin(); value=self.body(); user=self.app.store.save_user(int(value.get("tg_id") or 0),value); self.app.store.event("用户管理",f"更新用户：{user.get('name') or user.get('tg_id')}",str(user["tg_id"])); return self.send_json(200,{"message":"用户设置已保存","user":user})

@@ -135,6 +135,8 @@
       <input id="sourceId" type="hidden">
       <div class="grid">
         <label class="field"><span>名称</span><input id="sourceName" required></label>
+        <label class="field"><span>115 账号来源</span><select id="sourceCookieMode"><option value="global">使用服务设置中的全局源 CK</option><option value="independent">此监听目录使用独立 CK</option></select></label>
+        <label class="field wide"><span>独立 115 CK</span><textarea id="sourceCookie" rows="3" placeholder="选择独立 CK 时填写；编辑时留空表示保持原值"></textarea><small>CK 会加密保存，仅用于此目录的 115 API 轮询、文件秒传和源文件清理。</small></label>
         <label class="field"><span>目录 CID</span><div class="input-action"><input id="sourceCid" required><button type="button" id="pickSource115">选择 115 文件夹</button></div></label>
         <label class="field"><span>监听方式</span><select id="sourceMonitorType"><option value="api_poll">115 API 轮询</option><option value="cd2_realtime">CD2 本地实时监控（约 2 秒）</option><option value="cd2_poll">CD2 本地定时轮询</option><option value="cd2_api">CD2 API 轮询</option></select></label>
         <label class="field"><span>CD2 目录（容器内）</span><input id="sourceCd2Path" placeholder="/cd2/miaochuang/子目录"></label>

@@ -164,7 +164,7 @@ function renderSources(items = []) {
   const monitorLabels = {api_poll: '115 API 轮询', cd2_realtime: 'CD2 本地实时', cd2_poll: 'CD2 本地轮询', cd2_api: 'CD2 API 轮询'}
   $('sourcesList').innerHTML = items.length ? items.map(item => `<article class="source-card">
     <div class="source-title"><div><strong>${escapeHtml(item.name)}</strong><small>CID ${escapeHtml(item.cid)} · ${escapeHtml(monitorLabels[item.monitor_type] || '115 API 轮询')}</small>${item.cd2_path ? `<small>${escapeHtml(item.cd2_path)}</small>` : ''}</div>${badge(item.enabled ? 'active' : 'disabled')}</div>
-    <dl><div><dt>扫描间隔</dt><dd>${item.monitor_type === 'cd2_realtime' ? '约 2 秒' : `${escapeHtml(item.poll_seconds)} 秒`}</dd></div><div><dt>稳定等待</dt><dd>${escapeHtml(item.stable_seconds)} 秒</dd></div><div><dt>派送后删除</dt><dd>${escapeHtml(retentionText(item.retention_minutes))}</dd></div><div><dt>进入目录后删除</dt><dd>${escapeHtml(retentionText(item.age_delete_minutes))}</dd></div><div><dt>基线 / 新增</dt><dd>${escapeHtml(item.historical || 0)} / ${escapeHtml(item.added || 0)}</dd></div></dl>
+    <dl><div><dt>115 账号</dt><dd>${item.cookie_mode === 'independent' ? `独立 CK${item.cookie_configured ? '（已配置）' : '（未配置）'}` : '全局源 CK'}</dd></div><div><dt>扫描间隔</dt><dd>${item.monitor_type === 'cd2_realtime' ? '约 2 秒' : `${escapeHtml(item.poll_seconds)} 秒`}</dd></div><div><dt>稳定等待</dt><dd>${escapeHtml(item.stable_seconds)} 秒</dd></div><div><dt>派送后删除</dt><dd>${escapeHtml(retentionText(item.retention_minutes))}</dd></div><div><dt>进入目录后删除</dt><dd>${escapeHtml(retentionText(item.age_delete_minutes))}</dd></div><div><dt>基线 / 新增</dt><dd>${escapeHtml(item.historical || 0)} / ${escapeHtml(item.added || 0)}</dd></div></dl>
     <p class="source-meta">上次扫描：${escapeHtml(formatTime(item.last_scan))}${item.error ? `<span class="danger">${escapeHtml(item.error)}</span>` : ''}</p>
     <div class="row-actions"><button data-action="edit-source" data-id="${escapeHtml(item.id)}">编辑</button><button data-action="reset-source" data-id="${escapeHtml(item.id)}">重建基线</button><button class="danger-button" data-action="delete-source" data-id="${escapeHtml(item.id)}">删除</button></div>
   </article>`).join('') : '<div class="empty card">还没有监听目录，请先添加。</div>'
@@ -278,6 +278,9 @@ function openSource(id = '') {
   const source = (overview?.sources || []).find(item => item.id === id)
   $('sourceId').value = source?.id || ''
   $('sourceName').value = source?.name || ''
+  $('sourceCookieMode').value = source?.cookie_mode || 'global'
+  $('sourceCookie').value = ''
+  $('sourceCookie').placeholder = source?.cookie_configured ? '独立 CK 已配置，留空表示保持原值' : '选择独立 CK 时填写'
   $('sourceCid').value = source?.cid || '0'
   $('sourceMonitorType').value = source?.monitor_type || 'api_poll'
   $('sourceCd2Path').value = source?.cd2_path || overview?.config?.cd2_root || '/cd2/miaochuang'
@@ -295,16 +298,26 @@ function openSource(id = '') {
 async function loadFolderLevel() {
   const current = folderPicker.stack.at(-1)
   let path
+  let data
   if (folderPicker.provider === '115') {
-    const params = new URLSearchParams({provider: folderPicker.adminUser ? 'user115' : '115', cid: current.id})
-    if (folderPicker.adminUser) params.set('tg_id', folderPicker.adminUser)
-    path = `/api/admin/browse?${params}`
+    if (folderPicker.sourceAccount) {
+      data = await api('/api/admin/source-browse', 'POST', {
+        source_id: folderPicker.sourceId,
+        cookie_mode: folderPicker.cookieMode,
+        cookie: folderPicker.cookie,
+        cid: current.id,
+      })
+    } else {
+      const params = new URLSearchParams({provider: folderPicker.adminUser ? 'user115' : '115', cid: current.id})
+      if (folderPicker.adminUser) params.set('tg_id', folderPicker.adminUser)
+      path = `/api/admin/browse?${params}`
+    }
   } else {
     path = `/api/admin/browse?${new URLSearchParams({provider: 'cd2', mode: folderPicker.mode, path: current.id})}`
   }
   $('folderPath').textContent = folderPicker.stack.map(item => item.name).join(' / ') || '/'
   $('folderList').innerHTML = '<div class="folder-empty">正在读取...</div>'
-  const data = await api(path)
+  if (!data) data = await api(path)
   $('folderList').innerHTML = data.items.length ? data.items.map((item, index) => `<button type="button" class="folder-entry" data-folder-index="${index}">${escapeHtml(item.name)}</button>`).join('') : '<div class="folder-empty">这个文件夹内没有子文件夹</div>'
   folderPicker.items = data.items
   $('folderBack').disabled = folderPicker.stack.length <= 1
@@ -383,7 +396,10 @@ $('testCd2').addEventListener('click', () => perform(async () => {
   message(data.message || 'CD2 连接正常')
 }))
 
-$('pickSource115').addEventListener('click', () => openFolderPicker({provider: '115', title: '选择 115 监听目录', onSelect: folder => {
+$('pickSource115').addEventListener('click', () => openFolderPicker({
+  provider: '115', sourceAccount: true, sourceId: $('sourceId').value,
+  cookieMode: $('sourceCookieMode').value, cookie: $('sourceCookie').value.trim(),
+  title: '选择 115 监听目录', onSelect: folder => {
   $('sourceCid').value = folder.id
   $('sourceName').value ||= folder.name
 }}))
@@ -456,6 +472,7 @@ $('sourceForm').addEventListener('submit', event => {
   perform(async () => {
     const body = {
       name: $('sourceName').value.trim(),
+      cookie_mode: $('sourceCookieMode').value,
       cid: $('sourceCid').value.trim(),
       monitor_type: $('sourceMonitorType').value,
       cd2_path: $('sourceCd2Path').value.trim(),
@@ -465,8 +482,10 @@ $('sourceForm').addEventListener('submit', event => {
       age_delete_minutes: Number($('sourceAgeDelete').value),
       enabled: $('sourceEnabled').checked,
     }
+    if ($('sourceCookie').value.trim()) body.cookie = $('sourceCookie').value.trim()
     if ($('sourceId').value) body.id = $('sourceId').value
     await api('/api/admin/sources', 'PUT', body)
+    $('sourceCookie').value = ''
     $('sourceDialog').close()
     await refresh(false)
   }, '监听目录已保存')
