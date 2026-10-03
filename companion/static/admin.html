@@ -24,7 +24,7 @@
     </section>
 
     <section id="dashboard" hidden>
-      <div class="dashboard-bar"><span id="connection" class="status online">服务在线</span><button id="logout" class="ghost-button">退出登录</button></div>
+      <div class="dashboard-bar"><div class="service-state"><span id="connection" class="status online">服务在线</span><strong id="runtimeState">运行中</strong></div><div class="service-controls"><button id="resumeService" class="primary">运行</button><button id="pauseService">暂停</button><button id="restartService" class="danger-button">重启服务</button><button id="logout" class="ghost-button">退出登录</button></div></div>
       <div class="stats">
         <article class="card"><small>用户</small><strong id="users">0</strong></article>
         <article class="card"><small>待处理派送</small><strong id="pending">0</strong></article>
@@ -85,7 +85,7 @@
           <label class="field"><span>CD2 API Token</span><input id="cd2ApiToken" type="password" placeholder="留空表示不修改"></label>
           <label class="field"><span>派送并发数</span><input id="concurrency" type="number" min="1" max="10"></label>
           <label class="field"><span>CK 检查周期（小时）</span><input id="checkHours" type="number" min="1" max="168"></label>
-          <label class="field"><span>失败重试间隔（分钟）</span><input id="retryMinutes" type="number" min="1" max="1440"></label>
+          <label class="field"><span>失败重试基础间隔（分钟）</span><input id="retryMinutes" type="number" min="1" max="1440"><small>连续失败按 1、2、4、8、16 倍逐步延后。</small></label>
           <label class="field"><span>最大尝试次数</span><input id="maxAttempts" type="number" min="1" max="50"></label>
           <label class="field"><span>默认搜索额度</span><input id="searchLimit" type="number" min="1" max="1000"></label>
           <label class="field"><span>日志保留（天）</span><input id="logDays" type="number" min="1" max="365"></label>
@@ -93,8 +93,9 @@
           <label class="field"><span>115 API 最小间隔（秒）</span><input id="p115ApiInterval" type="number" min="0" max="3600" step="0.1"></label>
           <label class="field"><span>CD2 API 最小间隔（秒）</span><input id="cd2ApiInterval" type="number" min="0" max="3600" step="0.1"></label>
           <label class="field"><span>秒传任务最小间隔（秒）</span><input id="transferInterval" type="number" min="0" max="3600" step="0.1"></label>
+          <label class="field"><span>单个秒传总超时（秒）</span><input id="transferTimeout" type="number" min="30" max="3600" step="1"><small>默认 300 秒；超时后暂停该任务并按退避时间重试。</small></label>
         </div>
-        <div class="checks"><label class="check"><input id="enabled" type="checkbox"> 启用自动扫描与派送</label><label class="check"><input id="miniEnabled" type="checkbox"> 启用 Telegram 小程序</label></div>
+        <div class="checks"><label class="check"><input id="enabled" type="checkbox"> 启用自动扫描与派送</label><label class="check"><input id="distributedTransfer" type="checkbox"> 启用成功账号接力秒传（实验）</label><label class="check"><input id="miniEnabled" type="checkbox"> 启用 Telegram 小程序</label></div>
         <div class="actions"><button id="save" class="primary">保存设置</button><button id="testBot">测试 Bot</button><button id="testCd2">测试 CD2</button><button id="scan">立即扫描</button></div>
       </section>
 

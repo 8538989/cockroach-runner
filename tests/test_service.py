@@ -10,6 +10,58 @@ import service  # noqa: E402
 
 
 class ScanTests(unittest.TestCase):
+    def test_service_pause_recovers_running_tasks_and_resume_starts_service(self):
+        with tempfile.TemporaryDirectory() as data_dir:
+            store = service.Store(data_dir, Fernet.generate_key().decode())
+            stamp = service.now()
+            with store.db:
+                store.db.execute("INSERT INTO resources(id,node_id,name,first_seen) VALUES('r','1','Video.mkv',?)", (stamp,))
+                store.db.execute("INSERT INTO users(tg_id,created,updated) VALUES(1,?,?)", (stamp, stamp))
+                store.db.execute("INSERT INTO deliveries(id,resource_id,tg_id,status,created,updated) VALUES('d','r',1,'running',?,?)", (stamp, stamp))
+            store.service_action("pause")
+            row = store.db.execute("SELECT status,error FROM deliveries WHERE id='d'").fetchone()
+            self.assertEqual(row["status"], "retry")
+            self.assertIn("暂停", row["error"])
+            self.assertFalse(store.get("enabled"))
+            store.service_action("resume")
+            self.assertTrue(store.get("enabled"))
+            store.db.close()
+
+    def test_distributed_transfer_uses_a_successful_recipient_as_relay(self):
+        with tempfile.TemporaryDirectory() as data_dir:
+            store = service.Store(data_dir, Fernet.generate_key().decode())
+            store.set("source_cookie", "MAIN-CK", True)
+            store.upsert_user(1, "relay_user", "")
+            store.save_user(1, {"cookie": "RELAY-CK", "uid": "relay"})
+            store.upsert_user(2, "target_user", "")
+            store.save_user(2, {"cookie": "TARGET-CK", "uid": "target", "target_cid": "99"})
+            stamp = service.now()
+            with store.db:
+                store.db.execute("INSERT INTO resources(id,node_id,name,pickcode,sha1,size,first_seen,source_id) VALUES('r','10','Relay.mkv','pc','ABC',100,?,'legacy')", (stamp,))
+                store.db.execute("INSERT INTO deliveries(id,resource_id,tg_id,status,created,updated) VALUES('done','r',1,'delivered',?,?)", (stamp, stamp))
+                store.db.execute("INSERT INTO deliveries(id,resource_id,tg_id,status,created,updated) VALUES('target','r',2,'retry',?,?)", (stamp, stamp))
+            app = service.Application(store)
+            item = {"id": "target", "resource_id": "r", "tg_id": 2, "source_id": "legacy", "target_cid": "99",
+                    "name": "Relay.mkv", "node_id": "10", "pickcode": "pc", "sha1": "ABC", "size": 100,
+                    "is_dir": 0, "user_name": "", "username": "target_user", "note": ""}
+            calls = []
+            original_find, original_transfer = service.P115.find_file, service.P115.transfer
+            try:
+                service.P115.find_file = staticmethod(lambda cookie, entry: {**entry, "node_id": "relay-file", "pickcode": "relay-pc"})
+                service.P115.transfer = staticmethod(lambda source, target, entry, cid: calls.append((source, target, entry["pickcode"], cid)))
+                cfg = store.config(True); cfg.update({"distributed_transfer_enabled": True, "transfer_timeout_seconds": 30})
+                self.assertEqual(app.transfer_delivery(cfg, item, "TARGET-CK"), "接力：@relay_user")
+                self.assertEqual(calls, [("RELAY-CK", "TARGET-CK", "relay-pc", "99")])
+            finally:
+                service.P115.find_file, service.P115.transfer = original_find, original_transfer
+                store.db.close()
+
+    def test_transfer_error_hides_115_user_key(self):
+        error = RuntimeError({"pid": "1", "filename": "A.mkv", "filesha1": "ABC", "user_id": 9, "user_key": "SECRET"})
+        text = service.Application.transfer_error(error)
+        self.assertIn("UID 9", text)
+        self.assertNotIn("SECRET", text)
+
     def test_source_can_use_its_own_encrypted_115_cookie(self):
         with tempfile.TemporaryDirectory() as data_dir:
             store = service.Store(data_dir, Fernet.generate_key().decode())
@@ -129,6 +181,7 @@ class ScanTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as data_dir:
             store = service.Store(data_dir, Fernet.generate_key().decode())
             store.set("source_cookie", "source", True)
+            store.set("enabled", True)
             store.set("p115_api_interval_seconds", 0)
             store.upsert_user(123)
             store.save_user(123, {"cookie": "target", "uid": "u1"})
@@ -183,6 +236,7 @@ class ScanTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as data_dir:
             store = service.Store(data_dir, Fernet.generate_key().decode())
             store.set("source_cookie", "source", True)
+            store.set("enabled", True)
             store.set("p115_api_interval_seconds", 0)
             store.upsert_user(123)
             store.save_user(123, {"cookie": "target", "uid": "u1"})
@@ -265,6 +319,7 @@ class ScanTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as data_dir:
             store = service.Store(data_dir, Fernet.generate_key().decode())
             store.set("source_cookie", "source", True)
+            store.set("enabled", True)
             store.set("p115_api_interval_seconds", 0)
             store.set("cd2_api_interval_seconds", 0)
             store.upsert_user(123)

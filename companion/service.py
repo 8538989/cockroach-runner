@@ -164,6 +164,8 @@ class Store:
             "p115_api_interval_seconds": self.get("p115_api_interval_seconds", 1),
             "cd2_api_interval_seconds": self.get("cd2_api_interval_seconds", 1),
             "transfer_interval_seconds": self.get("transfer_interval_seconds", 3),
+            "transfer_timeout_seconds": self.get("transfer_timeout_seconds", 300),
+            "distributed_transfer_enabled": self.get("distributed_transfer_enabled", False),
         }
         if include_secrets:
             result["bot_token"] = self.get("bot_token", "")
@@ -176,10 +178,12 @@ class Store:
         if "cd2_port" in value: value["cd2_port"] = max(1, min(65535, int(value["cd2_port"])))
         for key in ("p115_api_interval_seconds", "cd2_api_interval_seconds", "transfer_interval_seconds"):
             if key in value: value[key] = max(0.0, min(3600.0, float(value[key])))
+        if "transfer_timeout_seconds" in value: value["transfer_timeout_seconds"] = max(30, min(3600, int(value["transfer_timeout_seconds"])))
         allowed = {"public_url", "source_cid", "scan_seconds", "enabled", "default_category", "concurrency",
                    "check_hours", "retry_minutes", "max_attempts", "search_limit", "log_days", "mini_enabled", "theme",
                    "cd2_mode", "cd2_host", "cd2_port", "cd2_root", "cd2_api_root"}
         allowed.update({"p115_api_interval_seconds", "cd2_api_interval_seconds", "transfer_interval_seconds"})
+        allowed.update({"transfer_timeout_seconds","distributed_transfer_enabled"})
         for key in allowed:
             if key in value: self.set(key, value[key])
         if value.get("bot_token"): self.set("bot_token", str(value["bot_token"]).strip(), True)
@@ -349,15 +353,42 @@ class Store:
     def delivery_action(self, value):
         did=str(value.get("id") or ""); action=str(value.get("action") or ""); stamp=now()
         with self.lock, self.db:
-            if action == "retry": changed=self.db.execute("UPDATE deliveries SET status='retry',error='',next_attempt=0,updated=? WHERE id=? AND status NOT IN ('running','delivered')",(stamp,did)).rowcount
+            if action == "retry": changed=self.db.execute("UPDATE deliveries SET status='retry',attempts=0,error='',next_attempt=0,updated=? WHERE id=? AND status NOT IN ('running','delivered')",(stamp,did)).rowcount
             elif action == "cancel": changed=self.db.execute("UPDATE deliveries SET status='cancelled',error='管理员已取消派送',next_attempt=0,updated=? WHERE id=? AND status NOT IN ('delivered','cancelled')",(stamp,did)).rowcount
-            elif action == "retry-all": changed=self.db.execute("UPDATE deliveries SET status='retry',error='',next_attempt=0,updated=? WHERE status IN ('waiting','retry','cancelled','failed')",(stamp,)).rowcount
+            elif action == "retry-all": changed=self.db.execute("UPDATE deliveries SET status='retry',attempts=0,error='',next_attempt=0,updated=? WHERE status IN ('waiting','retry','cancelled','failed')",(stamp,)).rowcount
             elif action == "cancel-all": changed=self.db.execute("UPDATE deliveries SET status='cancelled',error='管理员已取消全部派送',next_attempt=0,updated=? WHERE status IN ('waiting','retry','running')",(stamp,)).rowcount
             elif action == "delete-all": changed=self.db.execute("DELETE FROM deliveries").rowcount
             else: raise ValueError("未知派送操作")
         descriptions={"retry":"手动重派","cancel":"取消派送","retry-all":"全部重新派送","cancel-all":"取消全部派送","delete-all":"删除全部派送任务记录"}
         self.event("派送",f"{descriptions[action]}：{changed} 条",did)
         return changed
+
+    def service_action(self,action):
+        stamp=now()
+        if action not in {"resume","pause","restart"}: raise ValueError("未知服务操作")
+        if action == "resume":
+            self.set("enabled",True); self.event("服务控制","管理员启动自动扫描与派送"); return "服务已开始运行"
+        if action == "pause":
+            self.set("enabled",False)
+            with self.lock,self.db:
+                changed=self.db.execute("UPDATE deliveries SET status='retry',error='服务已暂停，等待恢复',next_attempt=0,updated=? WHERE status='running'",(stamp,)).rowcount
+            self.event("服务控制",f"管理员暂停自动扫描与派送；暂停运行中任务 {changed} 条")
+            return "服务已暂停"
+        self.event("服务控制","管理员请求重启服务")
+        return "服务正在重启"
+
+    def relay_candidates(self, resource_id, target_tg_id):
+        with self.lock: rows=self.db.execute("""SELECT u.tg_id,u.name,u.username,u.note,u.cookie,d.updated
+          FROM deliveries d JOIN users u ON u.tg_id=d.tg_id
+          WHERE d.resource_id=? AND d.status='delivered' AND d.tg_id<>? AND u.enabled=1 AND u.status='active' AND u.cookie<>''
+          ORDER BY d.updated DESC""",(resource_id,target_tg_id)).fetchall()
+        result=[]
+        for row in rows:
+            item=dict(row)
+            try: item["cookie"]=self.crypt.decrypt(item["cookie"].encode()).decode()
+            except InvalidToken: continue
+            result.append(item)
+        return result
 
     def resource_action(self, value):
         rid=str(value.get("id") or ""); action=str(value.get("action") or "")
@@ -409,7 +440,15 @@ class Store:
             deliveries=[]
             resources=[]
             bindings=[dict(row) for row in self.db.execute("SELECT id,code_hint,expires,status,used_by,created,plan,grant_days FROM bindings ORDER BY created DESC LIMIT 100")]
-            events=[dict(row) for row in self.db.execute("SELECT * FROM events ORDER BY created DESC LIMIT 200")]
+            events=[dict(row) for row in self.db.execute("""SELECT e.*,
+              COALESCE(NULLIF(u.name,''),CASE WHEN u.username<>'' THEN '@'||u.username END,
+                CASE WHEN u.tg_id IS NOT NULL THEN '用户 '||u.tg_id END,NULLIF(du.name,''),
+                CASE WHEN du.username<>'' THEN '@'||du.username END,CASE WHEN du.tg_id IS NOT NULL THEN '用户 '||du.tg_id END,
+                NULLIF(r.name,''),NULLIF(s.name,''),'—') object_label
+              FROM events e LEFT JOIN deliveries d ON d.id=e.object_id LEFT JOIN users u ON u.tg_id=d.tg_id
+              LEFT JOIN users du ON du.tg_id=CAST(e.object_id AS INTEGER)
+              LEFT JOIN resources r ON r.id=e.object_id LEFT JOIN sources s ON s.id=e.object_id
+              ORDER BY e.created DESC LIMIT 200""")]
         return {**self.status(),"users_list":users,"deliveries":deliveries,"sources":self.sources(),"resources":resources,"bindings":bindings,"events":events}
 
     def mini_overview(self, tg_id):
@@ -572,6 +611,26 @@ class P115:
                             "sha1": str(item.get("sha") or item.get("sha1") or ""),
                             "size": int(item.get("s") or item.get("size") or 0)})
         return entries
+
+    @staticmethod
+    def find_file(cookie, entry):
+        from p115client import P115Client
+        client=P115Client(P115.cookie_mapping(cookie))
+        title=re.split(r"\.(?:19|20)\d{2}\b|\.S\d{1,2}E\d{1,3}\b",entry["name"],maxsplit=1,flags=re.I)[0]
+        queries=list(dict.fromkeys(filter(None,(entry["name"],title.strip(" ._-"),Path(entry["name"]).stem))))
+        for query in queries:
+            result=client.fs_search({"search_value":query,"limit":115,"offset":0,"show_dir":0})
+            data=result.get("data") if isinstance(result,dict) else None
+            items=(data.get("data") or data.get("list") or []) if isinstance(data,dict) else data if isinstance(data,list) else []
+            for item in items:
+                sha1=str(item.get("sha") or item.get("sha1") or "").upper()
+                size=int(item.get("s") or item.get("size") or 0)
+                node_id=str(item.get("fid") or item.get("file_id") or "")
+                pickcode=str(item.get("pc") or item.get("pick_code") or "")
+                if node_id and pickcode and sha1==str(entry["sha1"]).upper() and size==int(entry["size"]):
+                    return {"node_id":node_id,"name":str(item.get("n") or item.get("fn") or item.get("file_name") or entry["name"]),
+                            "is_dir":False,"pickcode":pickcode,"sha1":sha1,"size":size}
+        return None
 
     @staticmethod
     def transfer(source_cookie, user_cookie, entry, target_cid):
@@ -779,6 +838,64 @@ class Application:
         self.cd2_gate = RateGate()
         self.transfer_gate = RateGate()
 
+    @staticmethod
+    def user_label(value):
+        return str(value.get("name") or value.get("user_name") or ("@"+value["username"] if value.get("username") else "") or value.get("note") or f"用户 {value.get('tg_id','未知')}")
+
+    @staticmethod
+    def transfer_error(exc):
+        if isinstance(exc,TimeoutError): return str(exc)
+        payload=exc.args[0] if getattr(exc,"args",None) and isinstance(exc.args[0],dict) else None
+        if payload and {"pid","filename","filesha1","user_id"}.issubset(payload):
+            return f"115 秒传初始化失败（目标账号 UID {payload.get('user_id')}，可能触发风控、秒传验证未通过或接口暂时异常）"
+        text=str(exc)
+        text=re.sub(r"(['\"]?(?:user_key|cookie|authorization)['\"]?\s*[:=]\s*)[^,;}]+",r"\1***",text,flags=re.I)
+        if "[Errno 61]" in text: return "115 接口暂时拒绝请求（Errno 61）"
+        return text[:500]
+
+    @staticmethod
+    def timed_call(callback, timeout_seconds):
+        result={}; finished=threading.Event()
+        def worker():
+            try: result["value"]=callback()
+            except BaseException as exc: result["error"]=exc
+            finally: finished.set()
+        threading.Thread(target=worker,daemon=True,name="transfer-call").start()
+        timeout=max(30,min(3600,int(timeout_seconds or 300)))
+        if not finished.wait(timeout): raise TimeoutError(f"秒传超过 {timeout} 秒，任务已暂停并等待稍后重试")
+        if "error" in result: raise result["error"]
+        return result.get("value")
+
+    def transfer_delivery(self,cfg,item,target_cookie):
+        timeout=cfg.get("transfer_timeout_seconds",300)
+        target_label=self.user_label(item)
+        relay_errors=[]
+        if cfg.get("distributed_transfer_enabled"):
+            for relay in self.store.relay_candidates(item["resource_id"],item["tg_id"]):
+                relay_label=self.user_label(relay)
+                try:
+                    def relay_action(relay=relay):
+                        relay_entry=P115.find_file(relay["cookie"],item)
+                        if not relay_entry: raise FileNotFoundError("成功账号中未找到文件，可能已删除或改名")
+                        relay_entry["name"]=item["name"]
+                        return P115.transfer(relay["cookie"],target_cookie,relay_entry,item["target_cid"])
+                    self.timed_call(relay_action,timeout)
+                    self.store.event("接力秒传",f"{relay_label} → {target_label}：{item['name']} 成功",item["id"])
+                    return f"接力：{relay_label}"
+                except TimeoutError:
+                    raise
+                except Exception as exc:
+                    error=self.transfer_error(exc); relay_errors.append(f"{relay_label}：{error}")
+                    self.store.event("接力跳过",f"{relay_label} → {target_label}：{item['name']}；{error}",item["id"])
+        source_cookie=self.store.source_cookie(item["source_id"],cfg["source_cookie"])
+        if not source_cookie: raise RuntimeError("资源所属监听目录没有可用的 115 CK")
+        try:
+            self.timed_call(lambda:P115.transfer(source_cookie,target_cookie,item,item["target_cid"]),timeout)
+            return "主源账号" if not relay_errors else "主源回退"
+        except Exception as exc:
+            error=self.transfer_error(exc)
+            if relay_errors: error=f"接力账号均失败（{'；'.join(relay_errors)}）；主源回退失败：{error}"
+            raise RuntimeError(error) from exc
     def mini_user(self, init_data):
         if not self.store.get("mini_enabled",True): raise PermissionError("小程序当前已停用")
         token = self.store.get("bot_token", "")
@@ -1004,7 +1121,7 @@ class Application:
     def deliver(self, cfg):
         max_attempts=max(1,min(50,int(cfg.get("max_attempts") or 5))); stamp=now()
         with self.store.lock:
-            rows = self.store.db.execute("""SELECT d.id,d.resource_id,d.tg_id,d.attempts,r.*,u.cookie,u.target_cid
+            rows = self.store.db.execute("""SELECT d.id,d.resource_id,d.tg_id,d.attempts,r.*,u.cookie,u.target_cid,u.name user_name,u.username,u.note
               FROM deliveries d JOIN resources r ON r.id=d.resource_id JOIN users u ON u.tg_id=d.tg_id
               WHERE d.status IN ('waiting','retry') AND d.attempts<? AND d.next_attempt<=? AND u.status='active' AND u.enabled=1 AND u.membership_expires>?
               ORDER BY d.created LIMIT 20""",(max_attempts,stamp,stamp)).fetchall()
@@ -1017,19 +1134,18 @@ class Application:
 
     def deliver_one(self,cfg,item):
         try:
+            if not self.store.get("enabled",False): return
             self.transfer_gate.wait(cfg.get("transfer_interval_seconds", 3))
             cookie = self.store.crypt.decrypt(item["cookie"].encode()).decode()
             with self.store.lock, self.store.db:
                 started=self.store.db.execute("UPDATE deliveries SET status='running',attempts=attempts+1,updated=? WHERE id=? AND status IN ('waiting','retry')", (now(), item["id"])).rowcount
             if not started: return
-            source_cookie=self.store.source_cookie(item["source_id"],cfg["source_cookie"])
-            if not source_cookie: raise RuntimeError("资源所属监听目录没有可用的 115 CK")
-            P115.transfer(source_cookie, cookie, item, item["target_cid"])
+            transfer_source=self.transfer_delivery(cfg,item,cookie)
             done=now()
             with self.store.lock, self.store.db:
                 current=self.store.db.execute("SELECT status FROM deliveries WHERE id=?",(item["id"],)).fetchone()
                 if not current or current["status"] != "running": return
-                self.store.db.execute("UPDATE deliveries SET status='delivered',error='',next_attempt=0,source='source115',updated=? WHERE id=?", (done, item["id"]))
+                self.store.db.execute("UPDATE deliveries SET status='delivered',error='',next_attempt=0,source=?,updated=? WHERE id=?", (transfer_source,done,item["id"]))
                 source=self.store.db.execute("SELECT retention_minutes,age_delete_minutes FROM sources WHERE id=?",(item["source_id"],)).fetchone()
                 retention=int(source[0]) if source else -1; age_delete=int(source[1]) if source else -1
                 due=done+retention*60 if retention>=0 else 0
@@ -1037,12 +1153,17 @@ class Application:
                   delete_due=CASE WHEN delete_due=0 THEN ? ELSE delete_due END,
                   cleanup=CASE WHEN ? >= 0 OR ? >= 0 THEN 'scheduled' ELSE 'retained' END WHERE id=?""",
                   (done,due,age_delete,retention,item["resource_id"]))
-            self.store.event("派送",f"派送成功：{item['name']}",item["id"])
+            target_label=self.user_label(item)
+            self.store.event("派送",f"{target_label}：{item['name']}；来源 {transfer_source}",item["id"])
             self.telegram.send(item["tg_id"], f"✅ <b>派送完成</b>\n{item['name']}", False)
         except Exception as exc:
-            failed=now(); delay=max(1,int(cfg.get("retry_minutes") or 15))*60
-            with self.store.lock, self.store.db: self.store.db.execute("UPDATE deliveries SET status='retry',error=?,next_attempt=?,updated=? WHERE id=? AND status='running'", (str(exc)[:500],failed+delay,failed,item["id"]))
-            self.store.event("派送失败",f"{item['name']}：{exc}",item["id"])
+            failed=now(); attempts=int(item.get("attempts") or 0)+1; max_attempts=max(1,min(50,int(cfg.get("max_attempts") or 5)))
+            delay=max(1,int(cfg.get("retry_minutes") or 15))*60*min(16,2**max(0,attempts-1))
+            status="failed" if attempts>=max_attempts else "retry"; error=self.transfer_error(exc)
+            with self.store.lock, self.store.db: self.store.db.execute("UPDATE deliveries SET status=?,error=?,next_attempt=?,updated=? WHERE id=? AND status='running'", (status,error,failed+delay if status=="retry" else 0,failed,item["id"]))
+            target_label=self.user_label(item)
+            wait_text=f"，{delay//60} 分钟后重试" if status=="retry" else "，已达到最大尝试次数"
+            self.store.event("派送失败",f"{target_label}：{item['name']}；{error}{wait_text}",item["id"])
 
     def cleanup(self,cfg):
         stamp=now()
@@ -1129,6 +1250,12 @@ class Handler(BaseHTTPRequestHandler):
             if path == "/api/admin/records" and method == "GET":
                 self.admin(); return self.send_json(200,self.app.store.records_page(str(query.get("type",[""])[0]),query.get("page",[1])[0],query.get("page_size",[100])[0]))
             if path == "/api/admin/config" and method == "PUT": self.admin(); self.app.store.save_config(self.body()); return self.send_json(200, {**self.app.store.status(), "message": "配置已保存"})
+            if path == "/api/admin/service" and method == "POST":
+                self.admin(); action=str(self.body().get("action") or ""); message=self.app.store.service_action(action)
+                if action=="restart":
+                    timer=threading.Timer(0.8,lambda:os._exit(0)); timer.daemon=True; timer.start()
+                    return self.send_json(202,{"ok":True,"message":message})
+                return self.send_json(200,{**self.app.store.status(),"message":message})
             if path == "/api/admin/browse" and method == "GET": self.admin(); return self.send_json(200, self.app.admin_browse(query))
             if path == "/api/admin/source-browse" and method == "POST": self.admin(); return self.send_json(200,self.app.source_browse(self.body()))
             if path == "/api/admin/test-cd2" and method == "POST": self.admin(); result=CD2.test(self.app.store.config(True)); return self.send_json(200,{"message":f"CD2 连接正常，读取到 {result['count']} 个项目",**result})

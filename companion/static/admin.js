@@ -8,7 +8,7 @@ const recordPageCounts = {deliveries: 1, resources: 1}
 
 const labels = {
   active: '正常', disabled: '停用', valid: '有效', invalid: '失效', missing: '未绑定',
-  waiting: '等待', running: '进行中', retry: '待重试', delivered: '已完成', cancelled: '已取消',
+  waiting: '等待', running: '进行中', retry: '待重试', failed: '失败', delivered: '已完成', cancelled: '已取消',
   historical: '历史基线', deleted: '已删除', retained: '永久保留', scheduled: '等待删除',
   blocked: '删除失败', available: '可用', used: '已使用', revoked: '已撤销', expired: '已过期',
   partial: '部分完成',
@@ -85,6 +85,10 @@ function renderStats(data) {
   $('sourceCount').textContent = (data.sources || []).length
   $('connection').textContent = '服务在线'
   $('connection').classList.add('online')
+  const running = Boolean(data.config?.enabled)
+  $('runtimeState').textContent = running ? '自动扫描与派送：运行中' : '自动扫描与派送：已暂停'
+  $('resumeService').disabled = running
+  $('pauseService').disabled = !running
   $('lastError').textContent = data.last_error || ''
   $('lastError').hidden = !data.last_error
 }
@@ -101,6 +105,8 @@ function renderSettings(config = {}) {
   $('p115ApiInterval').value = config.p115_api_interval_seconds ?? 1
   $('cd2ApiInterval').value = config.cd2_api_interval_seconds ?? 1
   $('transferInterval').value = config.transfer_interval_seconds ?? 3
+  $('transferTimeout').value = config.transfer_timeout_seconds ?? 300
+  $('distributedTransfer').checked = Boolean(config.distributed_transfer_enabled)
   $('enabled').checked = Boolean(config.enabled)
   $('miniEnabled').checked = config.mini_enabled !== false
   $('botToken').placeholder = config.bot_configured ? '已配置，留空表示不修改' : '尚未配置'
@@ -142,7 +148,7 @@ function renderDeliveries(items = []) {
       <td>${escapeHtml(item.user_name || item.username || item.tg_id)}</td>
       <td>${badge(item.status)}</td>
       <td>${escapeHtml(item.attempts || 0)}</td>
-      <td>${escapeHtml(formatTime(item.updated))}${item.error ? `<small class="danger">${escapeHtml(item.error)}</small>` : ''}</td>
+      <td>${escapeHtml(formatTime(item.updated))}${item.source ? `<small>来源：${escapeHtml(item.source)}</small>` : ''}${item.error ? `<small class="danger">${escapeHtml(item.error)}</small>` : ''}</td>
       <td><div class="row-actions">
         ${canRetry ? `<button class="small-button" data-action="delivery-retry" data-id="${escapeHtml(item.id)}">重派</button>` : ''}
         ${canCancel ? `<button class="small-button danger-button" data-action="delivery-cancel" data-id="${escapeHtml(item.id)}">取消</button>` : ''}
@@ -211,7 +217,7 @@ async function loadRecords(kind, page = recordPages[kind]) {
 }
 
 function renderEvents(items = []) {
-  $('eventsBody').innerHTML = items.length ? items.map(item => `<tr><td>${escapeHtml(formatTime(item.created))}</td><td>${escapeHtml(item.kind)}</td><td>${escapeHtml(item.message)}</td><td><code>${escapeHtml(item.object_id || '—')}</code></td></tr>`).join('') : emptyRow(4)
+  $('eventsBody').innerHTML = items.length ? items.map(item => `<tr><td>${escapeHtml(formatTime(item.created))}</td><td>${escapeHtml(item.kind)}</td><td>${escapeHtml(item.message)}</td><td>${escapeHtml(item.object_label || '—')}</td></tr>`).join('') : emptyRow(4)
 }
 
 function render(data) {
@@ -353,6 +359,30 @@ $('logout').addEventListener('click', () => {
   $('dashboard').hidden = true
   $('loginCard').hidden = false
 })
+$('resumeService').addEventListener('click', () => perform(async () => {
+  await api('/api/admin/service', 'POST', {action: 'resume'})
+  await refresh(false)
+}, '自动扫描与派送已开始运行'))
+$('pauseService').addEventListener('click', () => {
+  if (!confirm('确定暂停自动扫描与派送吗？未完成任务会保留，恢复运行后继续。')) return
+  return perform(async () => {
+    await api('/api/admin/service', 'POST', {action: 'pause'})
+    await refresh(false)
+  }, '自动扫描与派送已暂停')
+})
+$('restartService').addEventListener('click', async () => {
+  if (!confirm('确定重启蟑影递送服务吗？页面会在服务恢复后自动刷新。')) return
+  try {
+    const data = await api('/api/admin/service', 'POST', {action: 'restart'})
+    message(data.message || '服务正在重启')
+    $('restartService').disabled = true
+    for (let attempt = 0; attempt < 20; attempt += 1) {
+      await new Promise(resolve => setTimeout(resolve, 1000))
+      try { await refresh(false); message('服务重启完成'); break } catch (_) {}
+    }
+  } catch (error) { message(error.message, true) }
+  finally { $('restartService').disabled = false }
+})
 $('newSource').addEventListener('click', () => openSource())
 
 $('save').addEventListener('click', () => perform(async () => {
@@ -368,6 +398,8 @@ $('save').addEventListener('click', () => perform(async () => {
     p115_api_interval_seconds: Number($('p115ApiInterval').value || 0),
     cd2_api_interval_seconds: Number($('cd2ApiInterval').value || 0),
     transfer_interval_seconds: Number($('transferInterval').value || 0),
+    transfer_timeout_seconds: Number($('transferTimeout').value || 300),
+    distributed_transfer_enabled: $('distributedTransfer').checked,
     enabled: $('enabled').checked,
     mini_enabled: $('miniEnabled').checked,
     cd2_mode: $('cd2Mode').value,
