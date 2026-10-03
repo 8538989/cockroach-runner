@@ -124,7 +124,7 @@ async function bindAccount() {
   try {
     const data = await api("/api/mini/account", "PUT", { ...accountValues(), cookie });
     state.profile = data.user;
-    toast(`115 已绑定：${data.account?.name || data.account?.uid || "账号"}`);
+    toast(`CK 已验证并保存：${data.account?.name || data.account?.uid || "115账号"}`);
   } catch (error) {
     toast(error.message);
   } finally {
@@ -149,8 +149,27 @@ async function loadMiniFolders() {
   }
 }
 
-function openMiniFolderPicker() {
+async function openMiniFolderPicker() {
   state.accountDraft = accountValues();
+  const cookie = document.querySelector("#cookie")?.value.trim() || "";
+  if (!state.profile.account_bound && !cookie) {
+    toast("请先填写 115 CK，再选择接收文件夹");
+    return;
+  }
+  if (cookie) {
+    state.saving = true;
+    try {
+      const data = await api("/api/mini/account", "PUT", {...state.accountDraft, cookie});
+      state.profile = data.user;
+      toast("CK 已验证并安全保存，正在读取网盘目录");
+    } catch (error) {
+      toast(error.message);
+      state.saving = false;
+      render();
+      return;
+    }
+    state.saving = false;
+  }
   state.folder = {stack: [{id: "0", name: "根目录"}], items: [], loading: false};
   loadMiniFolders();
 }
@@ -323,12 +342,15 @@ function account() {
     <label class="field"><span>115 Cookie</span><textarea id="cookie" rows="4" placeholder="UID=...; CID=...; SEID=...; KID=..."></textarea></label>
     <label class="field"><span>目标目录 CID</span><input id="cid" value="${esc(target.target_cid)}"></label>
     <label class="field"><span>目标目录名称</span><input id="target" value="${esc(target.target_name)}"></label>
+    <p class="folder-tip">首次选择接收文件夹前，请先填写 115 CK。点击“从 115 网盘选择”时，系统会先验证并安全保存 CK，再为你打开网盘目录。</p>
     <button class="secondary full compact" data-folder-open>从 115 网盘选择接收文件夹</button>
     ${state.folder ? `<div class="mini-folder-picker">
       <div class="mini-folder-head"><button class="text-button" data-folder-back ${state.folder.stack.length <= 1 ? "disabled" : ""}>返回</button><strong>${esc(state.folder.stack.map(item => item.name).join(" / "))}</strong><button class="text-button" data-folder-close>关闭</button></div>
       ${state.folder.loading ? '<div class="folder-loading">正在读取...</div>' : state.folder.items.length ? state.folder.items.map((item, index) => `<button class="mini-folder-entry" data-folder-enter="${index}">📁 ${esc(item.name)}</button>`).join("") : '<div class="folder-loading">没有子文件夹</div>'}
       <button class="primary full" data-folder-select>选择当前文件夹</button>
     </div>` : ""}
+    <button class="secondary full compact" data-bind ${state.saving ? "disabled" : ""}>${state.saving ? "正在验证..." : "验证并保存 CK"}</button>
+    <div class="account-divider"><span>或使用扫码获取 CK</span></div>
     <label class="field"><span>扫码登录端</span><select id="qrApp" ${state.qr && !["expired","error"].includes(state.qr.status) ? "disabled" : ""}>${Object.entries(state.qrApps).map(([value, label]) => `<option value="${esc(value)}" ${selectedQrApp === value ? "selected" : ""}>${esc(label)}</option>`).join("")}</select></label>
     <button class="primary full" data-qr-start ${state.saving ? "disabled" : ""}>${state.saving ? "正在生成..." : "扫码获取 CK"}</button>
     ${state.qr ? `<div class="qr-card">
@@ -337,8 +359,6 @@ function account() {
       <small>${state.qr.error ? esc(state.qr.error) : "请使用 115 App 扫描，并在手机上确认登录。二维码约 5 分钟有效。"}</small>
       ${["expired","error"].includes(state.qr.status) ? '<button class="text-button" data-qr-start>重新生成</button>' : ''}
     </div>` : ''}
-    <div class="account-divider"><span>或者手动填写 CK</span></div>
-    <button class="secondary full" data-bind ${state.saving ? "disabled" : ""}>${state.saving ? "正在验证..." : "验证并绑定 CK"}</button>
   </section>`);
 }
 
