@@ -22,7 +22,7 @@ const state = {
 let qrTimer = null;
 
 const pages = [["home", "首页"], ["rules", "接收"], ["records", "记录"], ["account", "我的"]];
-const modeLabels = { all: "全部接收", subscription: "按订阅关键词", category: "按分类", both: "订阅和分类", tmdb: "按 TMDB 订阅", off: "关闭接收" };
+const modeLabels = { all: "全部接收", subscription: "按订阅关键词", category: "按分类", both: "订阅和分类（同时满足）", tmdb: "按 TMDB 订阅", off: "关闭接收" };
 const statusLabels = { waiting: "等待中", running: "派送中", retry: "重试中", delivered: "已完成", cancelled: "已取消", failed: "失败" };
 
 const esc = (value) => String(value ?? "").replace(/[&<>"']/g, (char) => ({
@@ -108,7 +108,7 @@ async function savePreferences() {
   try {
     const data = await api("/api/mini/preferences", "PUT", preferences);
     state.profile = data.user;
-    toast("接收设置已保存");
+    toast(data.cancelled ? `接收设置已保存，已取消 ${data.cancelled} 个不再匹配的待派送任务` : "接收设置已保存");
   } catch (error) {
     toast(error.message);
   } finally {
@@ -428,6 +428,7 @@ function deliveryRow(item) {
     <div>
       <strong>${esc(item.name || "未命名资源")}</strong>
       <small>${esc(item.category || "其他")} · ${time(item.created)}${item.attempts ? ` · 尝试 ${item.attempts} 次` : ""}</small>
+      ${item.destination ? `<small>📂 ${esc(item.destination)}</small>` : ""}
       ${item.error ? `<small class="danger-text">${esc(item.error)}</small>` : ""}
     </div>
     <span class="badge ${item.status === "delivered" ? "green" : item.status === "cancelled" || item.status === "failed" ? "red" : "blue"}">${statusLabels[item.status] || item.status}</span>

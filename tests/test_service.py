@@ -35,7 +35,7 @@ class ScanTests(unittest.TestCase):
             store.db.close()
 
     def test_tmdb_filename_parser_and_rich_caption(self):
-        item = {"name": "蝙蝠侠：黑暗骑士 (2008) - 2160p.HDR10.HEVC.mkv", "size": 68490000000, "category": "电影"}
+        item = {"name": "蝙蝠侠：黑暗骑士 (2008) - 2160p.HDR10.HEVC.mkv", "size": 68490000000, "category": "电影", "delivery_path": "/影视/电影"}
         parsed = service.TMDB.parse_name(item["name"], item["category"])
         self.assertEqual((parsed["title"], parsed["year"], parsed["media_type"]), ("蝙蝠侠：黑暗骑士", 2008, "movie"))
         metadata = {"id": 155, "media_type": "movie", "title": "蝙蝠侠：黑暗骑士", "release_date": "2008-07-16",
@@ -47,6 +47,7 @@ class ScanTests(unittest.TestCase):
         self.assertTrue(caption.startswith("🥳 <b>派送成功</b>\n"))
         self.assertIn("🎬 <b>蝙蝠侠：黑暗骑士 · 2008</b>", caption)
         self.assertIn("接收方式 蟑影派送", caption)
+        self.assertIn("落盘位置 <code>/影视/电影</code>", caption)
         self.assertIn("欧美电影", caption)
         self.assertIn("TMDB ID", caption)
         self.assertIn("4K / HDR10 / HEVC / MKV", caption)
@@ -68,7 +69,7 @@ class ScanTests(unittest.TestCase):
                 self.assertEqual((parsed["season"],parsed["episode"],parsed["episode_end"],parsed["title"]),expected)
 
     def test_tv_caption_and_plain_fallback_show_chinese_season_episode(self):
-        item={"id":"d","tg_id":123,"name":"三体.2026.S02E03-E04.2160p.mkv","size":100,"category":"剧集"}
+        item={"id":"d","tg_id":123,"name":"三体.2026.S02E03-E04.2160p.mkv","size":100,"category":"剧集","delivery_path":"/影视/剧集"}
         metadata={"id":100,"media_type":"tv","name":"三体","first_air_date":"2026-01-01"}
         caption=service.TMDB.caption(item,metadata)
         self.assertIn("第2季 · 第3-4集",caption)
@@ -78,6 +79,7 @@ class ScanTests(unittest.TestCase):
             app.telegram.send=lambda chat_id,text,webapp: calls.append((chat_id,text,webapp))
             app.notify_delivery_success({"tmdb_enabled":False,"tmdb_api_key":""},item)
             self.assertIn("📺 第2季 · 第3-4集",calls[0][1])
+            self.assertIn("📂 落盘位置：<code>/影视/剧集</code>",calls[0][1])
             store.db.close()
 
     def test_sha1_lookup_is_used_before_filename_search(self):
@@ -516,6 +518,43 @@ class ScanTests(unittest.TestCase):
         self.assertFalse(service.Application.matches(tmdb, "其他影片.2008.{tmdb-156}.mkv", "电影"))
         self.assertFalse(service.Application.matches(tmdb, "没有编号的影片.mkv", "电影"))
 
+    def test_anime_marker_takes_priority_over_episode_marker(self):
+        self.assertEqual(service.category_for("Example.Anime.S01E02.mkv", "电影"), "动漫")
+        self.assertEqual(service.category_for("普通剧.S01E02.mkv", "电影"), "剧集")
+
+    def test_saving_receive_rules_cancels_unmatched_pending_tasks(self):
+        with tempfile.TemporaryDirectory() as data_dir:
+            store=service.Store(data_dir,Fernet.generate_key().decode())
+            store.upsert_user(123,"user","")
+            store.save_user(123,{"cookie":"CK","uid":"1","target_cid":"9","target_name":"影视","account_ready":True})
+            stamp=service.now()
+            with store.db:
+                store.db.execute("INSERT INTO resources(id,node_id,name,category,first_seen) VALUES('tv','1','三体.S01E01.mkv','剧集',?)",(stamp,))
+                store.db.execute("INSERT INTO resources(id,node_id,name,category,first_seen) VALUES('movie','2','沙丘.2024.mkv','电影',?)",(stamp,))
+                store.db.execute("INSERT INTO deliveries(id,resource_id,tg_id,created,updated) VALUES('dtv','tv',123,?,?)",(stamp,stamp))
+                store.db.execute("INSERT INTO deliveries(id,resource_id,tg_id,status,created,updated) VALUES('dmovie','movie',123,'retry',?,?)",(stamp,stamp))
+            app=service.Application(store)
+            result=app.mini_preferences(123,{"mode":"both","categories":["剧集"],"include_terms":"三体","exclude_terms":"","hierarchy":True})
+            self.assertEqual(result["cancelled"],1)
+            self.assertEqual(store.db.execute("SELECT status FROM deliveries WHERE id='dtv'").fetchone()[0],"waiting")
+            self.assertEqual(store.db.execute("SELECT status FROM deliveries WHERE id='dmovie'").fetchone()[0],"cancelled")
+            result=app.mini_preferences(123,{"mode":"off","categories":[],"include_terms":"","exclude_terms":"","hierarchy":True})
+            self.assertEqual(result["cancelled"],1)
+            self.assertFalse(result["user"]["enabled"])
+            store.db.close()
+
+    def test_receive_rule_validation_rejects_incomplete_custom_modes(self):
+        with tempfile.TemporaryDirectory() as data_dir:
+            store=service.Store(data_dir,Fernet.generate_key().decode()); store.upsert_user(123)
+            app=service.Application(store)
+            with self.assertRaisesRegex(ValueError,"至少选择"):
+                app.mini_preferences(123,{"mode":"category","categories":[]})
+            with self.assertRaisesRegex(ValueError,"至少填写"):
+                app.mini_preferences(123,{"mode":"subscription","include_terms":""})
+            with self.assertRaisesRegex(ValueError,"同时"):
+                app.mini_preferences(123,{"mode":"both","categories":["剧集"],"include_terms":""})
+            store.db.close()
+
     def test_mini_account_is_not_ready_until_non_root_folder_is_saved(self):
         with tempfile.TemporaryDirectory() as data_dir:
             store = service.Store(data_dir, Fernet.generate_key().decode())
@@ -839,6 +878,47 @@ class ScanTests(unittest.TestCase):
             finally:
                 service.P115.list_dir = original_list
                 store.db.close()
+
+    def test_hierarchy_destination_creates_and_caches_category_folder(self):
+        with tempfile.TemporaryDirectory() as data_dir:
+            store=service.Store(data_dir,Fernet.generate_key().decode()); app=service.Application(store)
+            calls=[]; original=service.P115.ensure_folder
+            try:
+                service.P115.ensure_folder=staticmethod(lambda cookie,cid,name: calls.append((cookie,cid,name)) or "child-cid")
+                cfg={"p115_api_interval_seconds":0}
+                item={"tg_id":123,"target_cid":"base","target_name":"影视","hierarchy":1,"category":"剧集"}
+                self.assertEqual(app.prepare_destination(cfg,item,"CK"),("child-cid","/影视/剧集"))
+                self.assertEqual(app.prepare_destination(cfg,item,"CK"),("child-cid","/影视/剧集"))
+                self.assertEqual(calls,[("CK","base","剧集")])
+                item["hierarchy"]=0
+                self.assertEqual(app.prepare_destination(cfg,item,"CK"),("base","/影视"))
+            finally:
+                service.P115.ensure_folder=original; store.db.close()
+
+    def test_file_growth_resets_stability_without_duplicate_resources(self):
+        with tempfile.TemporaryDirectory() as data_dir:
+            store=service.Store(data_dir,Fernet.generate_key().decode())
+            store.set("source_cookie","SOURCE",True); store.set("p115_api_interval_seconds",0)
+            store.upsert_user(123); store.save_user(123,{"cookie":"TARGET","uid":"1","target_cid":"9","target_name":"影视","account_ready":True})
+            with store.db:
+                store.db.execute("UPDATE sources SET baseline_ready=1,monitor_type='api_poll',stable_seconds=30 WHERE id='legacy'")
+            app=service.Application(store); current={"size":100,"sha1":"A"}
+            original=service.P115.list_dir
+            try:
+                service.P115.list_dir=staticmethod(lambda *_args:[{"node_id":"same-file","name":"Growing.mkv","is_dir":False,"pickcode":"p","sha1":current["sha1"],"size":current["size"]}])
+                stamp=service.now(); source=store.sources()[0]
+                app.scan_source(store.config(True),source,stamp,False)
+                current.update(size=200,sha1="B")
+                app.scan_source(store.config(True),store.sources()[0],stamp+31,False)
+                row=store.db.execute("SELECT first_seen,status,size,sha1 FROM resources WHERE node_id='same-file'").fetchone()
+                self.assertEqual(tuple(row),(stamp+31,"stabilizing",200,"B"))
+                self.assertEqual(store.db.execute("SELECT COUNT(*) FROM resources WHERE node_id='same-file'").fetchone()[0],1)
+                self.assertEqual(store.db.execute("SELECT COUNT(*) FROM deliveries").fetchone()[0],0)
+                app.scan_source(store.config(True),store.sources()[0],stamp+62,False)
+                self.assertEqual(store.db.execute("SELECT status FROM resources WHERE node_id='same-file'").fetchone()[0],"waiting")
+                self.assertEqual(store.db.execute("SELECT COUNT(*) FROM deliveries").fetchone()[0],1)
+            finally:
+                service.P115.list_dir=original; store.db.close()
 
 
 if __name__ == "__main__":

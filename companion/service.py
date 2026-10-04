@@ -103,6 +103,7 @@ class Store:
                 ("resources","first_success","INTEGER NOT NULL DEFAULT 0"), ("resources","delete_due","INTEGER NOT NULL DEFAULT 0"),
                 ("resources","cleanup","TEXT NOT NULL DEFAULT 'waiting'"), ("resources","cleanup_error","TEXT NOT NULL DEFAULT ''"),
                 ("deliveries","next_attempt","INTEGER NOT NULL DEFAULT 0"), ("deliveries","source","TEXT NOT NULL DEFAULT ''"),
+                ("deliveries","destination","TEXT NOT NULL DEFAULT ''"),
                 ("sources","monitor_type","TEXT NOT NULL DEFAULT 'api_poll'"),
                 ("sources","cd2_path","TEXT NOT NULL DEFAULT ''"),
                 ("sources","age_delete_minutes","INTEGER NOT NULL DEFAULT -1"),
@@ -738,7 +739,9 @@ class TMDB:
         episode_line=f" · {episode_text}" if episode_text else ""
         lines=["🥳 <b>派送成功</b>",f"🎬 <b>{html.escape(title)}{(' · '+year) if year else ''}{episode_line}</b>","", "🎞 <b>影片资料</b>",
                f"├ 类型 {kind}",*([f"├ 季集 {episode_text}"] if episode_text else []),f'├ TMDB ID <a href="{tmdb_url}">{tmdb_id}</a>',f"├ 分类 {html.escape(category)}",
-               f"├ 评分 {rating:.1f} / 10",f"├ 主演 {actors}","├ 接收方式 蟑影派送",f"└ 大小 {TMDB.size_text(item.get('size',0))}","",
+               f"├ 评分 {rating:.1f} / 10",f"├ 主演 {actors}","├ 接收方式 蟑影派送",
+               f"├ 落盘位置 <code>{html.escape(str(item.get('delivery_path') or item.get('destination') or '/'+str(item.get('target_name') or '接收目录').strip('/')))}</code>",
+               f"└ 大小 {TMDB.size_text(item.get('size',0))}","",
                "🎥 <b>影音规格</b>",html.escape(spec_text),"", "📂 <b>文件列表 · 1 项</b>",f"1. <code>{html.escape(short_name)}</code>","",f"🏷 {html.escape(tag_line)}"]
         if imdb: lines.extend(["",f'🎬 <a href="https://www.imdb.com/title/{urllib.parse.quote(str(imdb))}/">IMDb {html.escape(str(imdb))}</a>'])
         overview=re.sub(r"\s+"," ",str(metadata.get("overview") or "")).strip()
@@ -867,6 +870,26 @@ class P115:
         from p115client import P115Client
         client=P115Client(P115.cookie_mapping(cookie))
         return P115._find_file_client(client,entry)
+
+    @staticmethod
+    def ensure_folder(cookie, parent_cid, name):
+        from p115client import P115Client
+        parent_cid=str(parent_cid or "0"); name=str(name or "").strip()
+        if not name or "/" in name or "\\" in name: raise ValueError("115 分类目录名称无效")
+        def find():
+            return next((item["node_id"] for item in P115.list_dir(cookie,parent_cid)
+                         if item["is_dir"] and item["name"]==name),"")
+        existing=find()
+        if existing: return existing
+        client=P115Client(P115.cookie_mapping(cookie))
+        result=client.fs_mkdir(name,pid=parent_cid)
+        if not isinstance(result,dict) or result.get("state") is False:
+            raise RuntimeError((result or {}).get("error") or "创建115分类目录失败")
+        for _ in range(6):
+            time.sleep(1)
+            existing=find()
+            if existing: return existing
+        raise RuntimeError("创建115分类目录后未找到目录")
 
     @staticmethod
     def transfer(source_cookie, user_cookie, entry, target_cid):
@@ -1066,9 +1089,9 @@ class CD2:
 
 def category_for(name, default):
     text = name.lower()
-    if re.search(r"\b(s\d{1,2}e\d{1,3}|ep?\d{1,3}|第.{1,4}集)\b", text, re.I): return "剧集"
     if any(word in text for word in ("anime", "动漫", "动画", "ova")): return "动漫"
     if any(word in text for word in ("documentary", "纪录片", "docu")): return "纪录片"
+    if re.search(r"(?:\b(?:s\d{1,2}e\d{1,3}|ep?\d{1,3})\b|第.{1,4}集)", text, re.I): return "剧集"
     return default or "电影"
 
 
@@ -1086,6 +1109,8 @@ class Application:
         self.cleanup_lock = threading.Lock()
         self.loop_errors = {}
         self.relay_failures = {}
+        self.destination_cache = {}
+        self.destination_lock = threading.Lock()
         self.p115_gate = RateGate()
         self.cd2_gate = RateGate()
         self.transfer_gate = RateGate()
@@ -1101,7 +1126,8 @@ class Application:
 
     def notify_delivery_success(self,cfg,item):
         parsed=TMDB.parse_name(item.get("name",""),item.get("category","")); episode_text=TMDB.episode_text(parsed)
-        fallback=f"🥳 <b>派送成功</b>\n🎬 {html.escape(str(item['name']))}"+(f"\n📺 {episode_text}" if episode_text else "")
+        destination=html.escape(str(item.get("delivery_path") or item.get("destination") or "/"+str(item.get("target_name") or "接收目录").strip("/")))
+        fallback=f"🥳 <b>派送成功</b>\n🎬 {html.escape(str(item['name']))}"+(f"\n📺 {episode_text}" if episode_text else "")+f"\n📂 落盘位置：<code>{destination}</code>"
         api_key=str(cfg.get("tmdb_api_key") or "")
         if not cfg.get("tmdb_enabled") or not api_key:
             return self.telegram.send(item["tg_id"],fallback,False)
@@ -1189,6 +1215,54 @@ class Application:
             error=self.transfer_error(exc)
             if relay_errors: error=f"接力账号均失败（{'；'.join(relay_errors)}）；主源回退失败：{error}"
             raise RuntimeError(error) from exc
+
+    def prepare_destination(self,cfg,item,target_cookie):
+        base_cid=str(item.get("target_cid") or "0")
+        base_name=str(item.get("target_name") or "接收目录").strip("/") or "接收目录"
+        if not bool(item.get("hierarchy")):
+            return base_cid,"/"+base_name
+        category=str(item.get("category") or "其他").strip() or "其他"
+        cache_key=(int(item["tg_id"]),base_cid,category)
+        with self.destination_lock:
+            cached=self.destination_cache.get(cache_key)
+            if cached:
+                return cached,"/"+base_name+"/"+category
+            # Keep folder discovery/creation single-flight so concurrent workers
+            # cannot create duplicate category folders for the same account.
+            self.p115_gate.wait(cfg.get("p115_api_interval_seconds",1))
+            folder_cid=P115.ensure_folder(target_cookie,base_cid,category)
+            self.destination_cache[cache_key]=folder_cid
+        return folder_cid,"/"+base_name+"/"+category
+
+    def reconcile_user_deliveries(self,user):
+        stamp=now(); cancelled=0
+        with self.store.lock,self.store.db:
+            rows=self.store.db.execute("""SELECT d.id,r.name,r.category FROM deliveries d
+              JOIN resources r ON r.id=d.resource_id WHERE d.tg_id=? AND d.status IN ('waiting','retry')""",(user["tg_id"],)).fetchall()
+            for row in rows:
+                if self.matches(user,row["name"],row["category"]): continue
+                cancelled+=self.store.db.execute("""UPDATE deliveries SET status='cancelled',error='接收规则已变更，未开始任务已取消',
+                  next_attempt=0,updated=? WHERE id=? AND status IN ('waiting','retry')""",(stamp,row["id"])).rowcount
+        if cancelled:
+            self.store.event("接收规则",f"{self.user_label(user)}：取消 {cancelled} 个不再匹配的待派送任务",str(user["tg_id"]))
+        return cancelled
+
+    def mini_preferences(self,tg_id,value):
+        mode=str(value.get("mode") or "all")
+        categories=[str(item) for item in (value.get("categories") or []) if str(item) in {"电影","剧集","动漫","纪录片","其他"}]
+        include_terms=str(value.get("include_terms") or "").strip()
+        if mode=="category" and not categories: raise ValueError("按分类接收时请至少选择一个分类")
+        if mode=="subscription" and not include_terms: raise ValueError("按订阅关键词接收时请至少填写一个关键词")
+        if mode=="both" and (not categories or not include_terms): raise ValueError("订阅和分类模式需要同时选择分类并填写关键词")
+        current=self.store.user(tg_id)
+        if mode=="tmdb" and not (current or {}).get("tmdb_subscriptions"): raise ValueError("请先在首页添加至少一个 TMDB 订阅")
+        update={"mode":mode,"enabled":mode!="off","categories":categories,
+                "include_terms":include_terms,"exclude_terms":str(value.get("exclude_terms") or "").strip(),
+                "hierarchy":bool(value.get("hierarchy",False))}
+        saved=self.store.save_user(tg_id,update)
+        cancelled=self.reconcile_user_deliveries(saved)
+        self.store.event("接收规则",f"{self.user_label(saved)}：保存 {mode} 模式，取消 {cancelled} 个待派送任务",str(tg_id))
+        return {"user":saved,"cancelled":cancelled}
     def mini_user(self, init_data):
         if not self.store.get("mini_enabled",True): raise PermissionError("小程序当前已停用")
         token = self.store.get("bot_token", "")
@@ -1322,6 +1396,7 @@ class Application:
             update={"tmdb_subscriptions":subscriptions,"mode":"tmdb","enabled":True}
         elif not subscriptions and user.get("mode")=="tmdb": update.update({"mode":"off","enabled":False})
         saved=self.store.save_user(tg_id,update)
+        self.reconcile_user_deliveries(saved)
         self.store.event("TMDB订阅",f"{saved.get('name') or saved.get('username') or tg_id}：{'添加' if action=='add' else '取消'} {tmdb_id}",str(tg_id))
         return {"user":saved}
 
@@ -1487,10 +1562,19 @@ class Application:
                     # Preserve IDs created by versions before multi-source support,
                     # otherwise an upgrade would enqueue every existing file again.
                     rid=hashlib.sha256((identity if source["id"]=="legacy" else source["id"]+":"+identity).encode()).hexdigest()
-                    row=self.store.db.execute("SELECT * FROM resources WHERE id=?",(rid,)).fetchone()
+                    row=self.store.db.execute("""SELECT * FROM resources WHERE source_id=? AND node_id=?
+                      ORDER BY first_seen DESC LIMIT 1""",(source["id"],entry["node_id"])).fetchone()
+                    if not row: row=self.store.db.execute("SELECT * FROM resources WHERE id=?",(rid,)).fetchone()
                     if row:
-                        if row["status"]=="stabilizing" and stamp-int(row["first_seen"])>=int(source["stable_seconds"]):
-                            self.store.db.execute("UPDATE resources SET status='waiting' WHERE id=?",(rid,)); self.queue_resource(rid,entry["name"],row["category"],stamp)
+                        row_id=row["id"]
+                        changed=(row["name"]!=entry["name"] or int(row["size"] or 0)!=int(entry["size"] or 0)
+                                 or str(row["sha1"] or "").upper()!=str(entry["sha1"] or "").upper())
+                        if row["status"]=="stabilizing" and changed:
+                            cat=category_for(entry["name"],cfg["default_category"])
+                            self.store.db.execute("""UPDATE resources SET name=?,pickcode=?,sha1=?,size=?,category=?,first_seen=? WHERE id=?""",
+                              (entry["name"],entry["pickcode"],entry["sha1"],entry["size"],cat,stamp,row_id))
+                        elif row["status"]=="stabilizing" and stamp-int(row["first_seen"])>=int(source["stable_seconds"]):
+                            self.store.db.execute("UPDATE resources SET status='waiting' WHERE id=?",(row_id,)); self.queue_resource(row_id,entry["name"],row["category"],stamp)
                         continue
                     discovered+=1; cat=category_for(entry["name"],cfg["default_category"])
                     status="historical" if not baseline else ("stabilizing" if int(source["stable_seconds"])>0 else "waiting")
@@ -1528,9 +1612,11 @@ class Application:
         if mode == "tmdb":
             parsed=TMDB.parse_name(name,category); tmdb_id=parsed["tmdb_id"]
             if not tmdb_id: return False
-            subscriptions=json.loads(user.get("tmdb_subscriptions") or "[]")
+            raw_subscriptions=user.get("tmdb_subscriptions") or []
+            subscriptions=raw_subscriptions if isinstance(raw_subscriptions,list) else json.loads(raw_subscriptions)
             return any(int(item.get("id") or 0)==tmdb_id and item.get("media_type")==parsed["media_type"] for item in subscriptions)
-        categories = json.loads(user.get("categories") or "[]")
+        raw_categories=user.get("categories") or []
+        categories=raw_categories if isinstance(raw_categories,list) else json.loads(raw_categories)
         cat_ok = category in categories
         terms = [x.strip().lower() for x in re.split(r"[,，;；\n]+",str(user.get("include_terms") or "")) if x.strip()]
         term_ok = bool(terms) and any(x in lower for x in terms)
@@ -1548,7 +1634,7 @@ class Application:
     def _deliver(self, cfg):
         max_attempts=max(1,min(50,int(cfg.get("max_attempts") or 5))); stamp=now()
         with self.store.lock:
-            rows = self.store.db.execute("""SELECT d.id,d.resource_id,d.tg_id,d.attempts,r.*,u.cookie,u.target_cid,u.name user_name,u.username,u.note
+            rows = self.store.db.execute("""SELECT d.id,d.resource_id,d.tg_id,d.attempts,r.*,u.cookie,u.target_cid,u.target_name,u.hierarchy,u.name user_name,u.username,u.note
               FROM deliveries d JOIN resources r ON r.id=d.resource_id JOIN users u ON u.tg_id=d.tg_id
               WHERE d.status IN ('waiting','retry') AND d.attempts<? AND d.next_attempt<=? AND u.status='active' AND u.enabled=1 AND u.account_ready=1 AND u.target_cid NOT IN ('','0') AND u.membership_expires>?
               ORDER BY d.created LIMIT 20""",(max_attempts,stamp,stamp)).fetchall()
@@ -1567,12 +1653,14 @@ class Application:
             with self.store.lock, self.store.db:
                 started=self.store.db.execute("UPDATE deliveries SET status='running',attempts=attempts+1,updated=? WHERE id=? AND status IN ('waiting','retry')", (now(), item["id"])).rowcount
             if not started: return
+            destination_cid,delivery_path=self.prepare_destination(cfg,item,cookie)
+            item["target_cid"]=destination_cid; item["delivery_path"]=delivery_path
             transfer_source=self.transfer_delivery(cfg,item,cookie)
             done=now()
             with self.store.lock, self.store.db:
                 current=self.store.db.execute("SELECT status FROM deliveries WHERE id=?",(item["id"],)).fetchone()
                 if not current or current["status"] != "running": return
-                self.store.db.execute("UPDATE deliveries SET status='delivered',error='',next_attempt=0,source=?,updated=? WHERE id=?", (transfer_source,done,item["id"]))
+                self.store.db.execute("UPDATE deliveries SET status='delivered',error='',next_attempt=0,source=?,destination=?,updated=? WHERE id=?", (transfer_source,delivery_path,done,item["id"]))
                 source=self.store.db.execute("SELECT retention_minutes,age_delete_minutes FROM sources WHERE id=?",(item["source_id"],)).fetchone()
                 retention=int(source[0]) if source else -1; age_delete=int(source[1]) if source else -1
                 due=done+retention*60 if retention>=0 else 0
@@ -1581,7 +1669,7 @@ class Application:
                   cleanup=CASE WHEN ? >= 0 OR ? >= 0 THEN 'scheduled' ELSE 'retained' END WHERE id=?""",
                   (done,due,age_delete,retention,item["resource_id"]))
             target_label=self.user_label(item)
-            self.store.event("派送",f"{target_label}：{item['name']}；来源 {transfer_source}",item["id"])
+            self.store.event("派送",f"{target_label}：{item['name']}；来源 {transfer_source}；落盘 {delivery_path}",item["id"])
             if cfg.get("distributed_transfer_enabled"):
                 woken=self.store.wake_relay_retries(item["resource_id"],item["id"])
                 if woken:
@@ -1753,7 +1841,7 @@ class Handler(BaseHTTPRequestHandler):
             if path == "/api/mini/browse" and method == "GET": uid=self.mini(); return self.send_json(200, self.app.mini_browse(uid,query))
             if path == "/api/mini/tmdb/search" and method == "GET": self.mini(); return self.send_json(200,{"items":self.app.mini_tmdb_search(query.get("q",[""])[0])})
             if path == "/api/mini/tmdb/subscriptions" and method == "POST": uid=self.mini(); return self.send_json(200,self.app.mini_tmdb_subscription(uid,self.body()))
-            if path == "/api/mini/preferences" and method == "PUT": uid=self.mini(); return self.send_json(200, {"user": self.app.store.save_user(uid, self.body())})
+            if path == "/api/mini/preferences" and method == "PUT": uid=self.mini(); return self.send_json(200,self.app.mini_preferences(uid,self.body()))
             if path == "/api/mini/account/validate" and method == "POST": uid=self.mini(); return self.send_json(200,self.app.mini_account_validate(uid,self.body()))
             if path == "/api/mini/account" and method == "PUT":
                 uid=self.mini(); return self.send_json(200,self.app.mini_account_save(uid,self.body()))
