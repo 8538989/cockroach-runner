@@ -109,6 +109,8 @@ function renderSettings(config = {}) {
   $('transferInterval').value = config.transfer_interval_seconds ?? 3
   $('transferTimeout').value = config.transfer_timeout_seconds ?? 300
   $('distributedTransfer').checked = Boolean(config.distributed_transfer_enabled)
+  $('resourceFallback').checked = config.resource_fallback_enabled !== false
+  $('resourceCooldown').value = config.resource_cooldown_minutes ?? 360
   $('tmdbEnabled').checked = Boolean(config.tmdb_enabled)
   $('enabled').checked = Boolean(config.enabled)
   $('miniEnabled').checked = config.mini_enabled !== false
@@ -404,6 +406,8 @@ $('save').addEventListener('click', () => perform(async () => {
     transfer_interval_seconds: Number($('transferInterval').value || 0),
     transfer_timeout_seconds: Number($('transferTimeout').value || 300),
     distributed_transfer_enabled: $('distributedTransfer').checked,
+    resource_fallback_enabled: $('resourceFallback').checked,
+    resource_cooldown_minutes: Number($('resourceCooldown').value || 360),
     tmdb_enabled: $('tmdbEnabled').checked,
     enabled: $('enabled').checked,
     mini_enabled: $('miniEnabled').checked,
