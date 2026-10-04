@@ -8,6 +8,7 @@ services:
       COCKROACH_ADMIN_USERNAME: ${COCKROACH_ADMIN_USERNAME:?请在 .env 中设置管理员用户名}
       COCKROACH_ADMIN_PASSWORD: ${COCKROACH_ADMIN_PASSWORD:?请在 .env 中设置管理员密码}
       COCKROACH_ENCRYPTION_KEY: ${COCKROACH_ENCRYPTION_KEY:?请在 .env 中设置 Fernet 密钥}
+      COCKROACH_ACTIVATION_CODE: ${COCKROACH_ACTIVATION_CODE:?请在 .env 中设置从 Evan 获取的激活码}
       HOME: /data
       XDG_CACHE_HOME: /data/.cache
     user: "${COCKROACH_UID:-10001}:${COCKROACH_GID:-10001}"

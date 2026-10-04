@@ -22,6 +22,7 @@ from pathlib import Path
 from cryptography.fernet import Fernet, InvalidToken
 
 APP_NAME = "蟑影递送"
+ACTIVATION_SHA256 = "e14a944c3a27cb5bc10b0ae4374846c3c6854c9defd5df853af39cb294396e79"
 VIDEO_EXTENSIONS = {".mkv", ".mp4", ".avi", ".mov", ".wmv", ".ts", ".m2ts", ".iso"}
 QR_LOGIN_APPS = {
     "alipaymini": "115生活（支付宝小程序）",
@@ -39,6 +40,7 @@ QR_LOGIN_APPS = {
 
 def now(): return int(time.time())
 def dumps(value): return json.dumps(value, ensure_ascii=False, separators=(",", ":"))
+def activation_valid(value): return hmac.compare_digest(hashlib.sha256(str(value or "").encode()).hexdigest(),ACTIVATION_SHA256)
 def redact_sensitive_text(value):
     return re.sub(r"(['\"]?(?:user_key|cookie|authorization|api_key|tmdb_api_key|token)['\"]?\s*[:=]\s*)('[^']*'|\"[^\"]*\"|[^,;}\s&]+)",r"\1'***'",str(value),flags=re.I)
 
@@ -1874,6 +1876,8 @@ class Handler(BaseHTTPRequestHandler):
 
 def main():
     parser=argparse.ArgumentParser(); parser.add_argument("--host",default="127.0.0.1"); parser.add_argument("--port",type=int,default=8790); parser.add_argument("--data",default="/var/lib/cockroach-runner"); parser.add_argument("--static",default=str(Path(__file__).with_name("static"))); args=parser.parse_args()
+    if not activation_valid(os.environ.get("COCKROACH_ACTIVATION_CODE")):
+        raise SystemExit("蟑影递送激活失败：请在环境变量 COCKROACH_ACTIVATION_CODE 中填写有效激活码")
     admin_username=os.environ["COCKROACH_ADMIN_USERNAME"]; admin_password=os.environ["COCKROACH_ADMIN_PASSWORD"]; encryption_key=os.environ["COCKROACH_ENCRYPTION_KEY"]
     app=Application(Store(args.data,encryption_key)); server=ThreadingHTTPServer((args.host,args.port),Handler); server.app=app; server.admin_username=admin_username; server.admin_password=admin_password; server.static_dir=args.static
     threading.Thread(target=app.telegram.loop,daemon=True,name="telegram").start()

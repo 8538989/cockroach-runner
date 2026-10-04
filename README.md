@@ -33,7 +33,7 @@ cp .env.example .env
 python -c "import base64,secrets; print(base64.urlsafe_b64encode(secrets.token_bytes(32)).decode())"
 ```
 
-把管理员用户名、强密码填入 `.env` 的 `COCKROACH_ADMIN_USERNAME`、`COCKROACH_ADMIN_PASSWORD`，把生成值填入 `COCKROACH_ENCRYPTION_KEY`，然后启动：
+把管理员用户名、强密码填入 `.env` 的 `COCKROACH_ADMIN_USERNAME`、`COCKROACH_ADMIN_PASSWORD`，把生成值填入 `COCKROACH_ENCRYPTION_KEY`，并向 Evan 获取激活码填入 `COCKROACH_ACTIVATION_CODE`。缺少或填错激活码时原版服务会拒绝启动。然后启动：
 
 ```bash
 docker compose up -d --build
@@ -93,4 +93,11 @@ curl http://127.0.0.1:8790/healthz
 ```bash
 python -m unittest discover -s tests -v
 node --check companion/static/admin.js
+node --check companion/static/app.js
 ```
+
+## 小程序与项目结构
+
+Telegram 小程序不是外部依赖，已随独立项目一起维护在 `companion/static/`。Docker 构建会把管理页、小程序 HTML/CSS/JavaScript、二维码样式和品牌素材一起复制进镜像，不需要另外部署前端项目。
+
+更完整的安装、配置、更新、备份和故障排查说明见 [`docs/wiki/Home.md`](docs/wiki/Home.md)。

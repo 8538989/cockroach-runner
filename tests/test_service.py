@@ -10,6 +10,16 @@ import service  # noqa: E402
 
 
 class ScanTests(unittest.TestCase):
+    def test_activation_code_is_required_without_storing_plaintext(self):
+        original=service.ACTIVATION_SHA256
+        try:
+            service.ACTIVATION_SHA256=service.hashlib.sha256(b"unit-test-activation").hexdigest()
+            self.assertTrue(service.activation_valid("unit-test-activation"))
+            self.assertFalse(service.activation_valid(""))
+            self.assertFalse(service.activation_valid("wrong-code"))
+        finally:
+            service.ACTIVATION_SHA256=original
+
     def test_monitor_loop_is_decoupled_from_delivery_and_recovers_after_exception(self):
         with tempfile.TemporaryDirectory() as data_dir:
             store = service.Store(data_dir, Fernet.generate_key().decode())
