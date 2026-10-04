@@ -196,7 +196,7 @@ class ScanTests(unittest.TestCase):
             try:
                 service.P115.find_file = staticmethod(lambda cookie, entry: {**entry, "node_id": "relay-file", "pickcode": "relay-pc"})
                 service.P115.transfer = staticmethod(lambda source, target, entry, cid: calls.append((source, target, entry["pickcode"], cid)))
-                cfg = store.config(True); cfg.update({"distributed_transfer_enabled": True, "transfer_timeout_seconds": 30})
+                cfg = store.config(True); cfg.update({"distributed_transfer_enabled": True, "transfer_timeout_seconds": 30, "relay_stabilize_seconds": 0})
                 self.assertEqual(app.transfer_delivery(cfg, item, "TARGET-CK"), "接力：@relay_user")
                 self.assertEqual(calls, [("RELAY-CK", "TARGET-CK", "relay-pc", "99")])
             finally:
@@ -223,18 +223,71 @@ class ScanTests(unittest.TestCase):
             timeouts = []
             original_find, original_transfer, original_monotonic = service.P115.find_file, service.P115.transfer, service.time.monotonic
             try:
-                service.P115.find_file = staticmethod(lambda cookie, entry: None)
+                service.P115.find_file = staticmethod(lambda cookie, entry: None if cookie == "RELAY-CK" else {**entry, "node_id": "fresh-main", "pickcode": "fresh-pc"})
                 service.P115.transfer = staticmethod(lambda source, target, entry, cid: calls.append((source, target, entry["pickcode"], cid)))
                 moments = iter((100, 110, 125))
                 service.time.monotonic = lambda: next(moments)
                 app.timed_call = lambda callback, timeout: timeouts.append(timeout) or callback()
-                cfg = store.config(True); cfg.update({"distributed_transfer_enabled": True, "transfer_timeout_seconds": 30})
+                cfg = store.config(True); cfg.update({"distributed_transfer_enabled": True, "transfer_timeout_seconds": 30, "relay_stabilize_seconds": 0})
                 self.assertEqual(app.transfer_delivery(cfg, item, "TARGET-CK"), "主源回退")
-                self.assertEqual(calls, [("MAIN-CK", "TARGET-CK", "pc", "99")])
+                self.assertEqual(calls, [("MAIN-CK", "TARGET-CK", "fresh-pc", "99")])
                 self.assertEqual(timeouts, [20, 5])
             finally:
                 service.P115.find_file, service.P115.transfer, service.time.monotonic = original_find, original_transfer, original_monotonic
                 store.db.close()
+
+    def test_relay_relocates_by_sha1_when_organizer_moves_file_during_transfer(self):
+        with tempfile.TemporaryDirectory() as data_dir:
+            store = service.Store(data_dir, Fernet.generate_key().decode())
+            store.set("source_cookie", "MAIN-CK", True)
+            store.upsert_user(1, "relay_user", "")
+            store.save_user(1, {"cookie": "RELAY-CK", "uid": "relay"})
+            stamp = service.now() - 60
+            with store.db:
+                store.db.execute("INSERT INTO resources(id,node_id,name,pickcode,sha1,size,first_seen,source_id) VALUES('r','10','Moved.mkv','pc','ABC',100,?,'legacy')", (stamp,))
+                store.db.execute("INSERT INTO deliveries(id,resource_id,tg_id,status,created,updated) VALUES('done','r',1,'delivered',?,?)", (stamp, stamp))
+            app = service.Application(store)
+            item = {"id": "target", "resource_id": "r", "tg_id": 2, "source_id": "legacy", "target_cid": "99",
+                    "name": "Moved.mkv", "node_id": "10", "pickcode": "pc", "sha1": "ABC", "size": 100,
+                    "is_dir": 0, "user_name": "目标用户", "username": "", "note": ""}
+            finds = []
+            transfers = []
+            original_find, original_transfer, original_sleep = service.P115.find_file, service.P115.transfer, service.time.sleep
+            try:
+                def fake_find(cookie, entry):
+                    finds.append(cookie)
+                    return {**entry, "node_id": f"node-{len(finds)}", "pickcode": f"pick-{len(finds)}"}
+                def fake_transfer(source, target, entry, cid):
+                    transfers.append(entry["pickcode"])
+                    if len(transfers) == 1:
+                        raise RuntimeError("文件（夹）不存在或已经删除。")
+                service.P115.find_file = staticmethod(fake_find)
+                service.P115.transfer = staticmethod(fake_transfer)
+                service.time.sleep = lambda seconds: None
+                cfg = store.config(True); cfg.update({"distributed_transfer_enabled": True, "transfer_timeout_seconds": 30, "relay_stabilize_seconds": 0})
+                self.assertEqual(app.transfer_delivery(cfg, item, "TARGET-CK"), "接力：@relay_user")
+                self.assertEqual(finds, ["RELAY-CK", "RELAY-CK"])
+                self.assertEqual(transfers, ["pick-1", "pick-2"])
+            finally:
+                service.P115.find_file, service.P115.transfer, service.time.sleep = original_find, original_transfer, original_sleep
+                store.db.close()
+
+    def test_relay_stability_window_delays_wake_and_excludes_fresh_candidate(self):
+        with tempfile.TemporaryDirectory() as data_dir:
+            store = service.Store(data_dir, Fernet.generate_key().decode())
+            store.upsert_user(1, "relay", ""); store.save_user(1, {"cookie": "RELAY-CK", "uid": "relay"})
+            store.upsert_user(2, "target", "")
+            stamp = service.now()
+            with store.db:
+                store.db.execute("INSERT INTO resources(id,node_id,name,sha1,size,first_seen) VALUES('r','1','Stable.mkv','ABC',100,?)", (stamp,))
+                store.db.execute("INSERT INTO deliveries(id,resource_id,tg_id,status,created,updated) VALUES('done','r',1,'delivered',?,?)", (stamp, stamp))
+                store.db.execute("INSERT INTO deliveries(id,resource_id,tg_id,status,next_attempt,created,updated) VALUES('retry','r',2,'retry',0,?,?)", (stamp, stamp))
+            self.assertEqual(store.relay_candidates("r", 2, "ABC", 100, 12), [])
+            self.assertEqual(store.wake_relay_retries("r", "done", 12), 1)
+            row = store.db.execute("SELECT next_attempt,error FROM deliveries WHERE id='retry'").fetchone()
+            self.assertGreaterEqual(row["next_attempt"], stamp + 12)
+            self.assertIn("等待文件位置稳定", row["error"])
+            store.db.close()
 
     def test_successful_recipient_wakes_retry_and_failed_peers_for_relay(self):
         with tempfile.TemporaryDirectory() as data_dir:
@@ -255,7 +308,7 @@ class ScanTests(unittest.TestCase):
             cancelled = store.db.execute("SELECT status FROM deliveries WHERE id='cancelled'").fetchone()
             self.assertEqual((retry["status"], retry["attempts"], retry["next_attempt"]), ("retry", 2, 0))
             self.assertEqual((failed["status"], failed["attempts"], failed["next_attempt"]), ("retry", 0, 0))
-            self.assertIn("立即尝试接力秒传", failed["error"])
+            self.assertIn("等待文件位置稳定后尝试接力秒传", failed["error"])
             self.assertEqual(cancelled["status"], "cancelled")
             store.db.close()
 

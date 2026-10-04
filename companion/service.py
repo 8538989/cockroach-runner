@@ -180,6 +180,7 @@ class Store:
             "cd2_api_interval_seconds": self.get("cd2_api_interval_seconds", 1),
             "transfer_interval_seconds": self.get("transfer_interval_seconds", 3),
             "transfer_timeout_seconds": self.get("transfer_timeout_seconds", 300),
+            "relay_stabilize_seconds": self.get("relay_stabilize_seconds", 12),
             "distributed_transfer_enabled": self.get("distributed_transfer_enabled", False),
             "tmdb_enabled": self.get("tmdb_enabled", False),
             "tmdb_configured": bool(self.get("tmdb_api_key", "")),
@@ -197,11 +198,12 @@ class Store:
         for key in ("p115_api_interval_seconds", "cd2_api_interval_seconds", "transfer_interval_seconds"):
             if key in value: value[key] = max(0.0, min(3600.0, float(value[key])))
         if "transfer_timeout_seconds" in value: value["transfer_timeout_seconds"] = max(30, min(3600, int(value["transfer_timeout_seconds"])))
+        if "relay_stabilize_seconds" in value: value["relay_stabilize_seconds"] = max(0, min(300, int(value["relay_stabilize_seconds"])))
         allowed = {"public_url", "source_cid", "scan_seconds", "enabled", "default_category", "concurrency",
                    "check_hours", "retry_minutes", "max_attempts", "search_limit", "log_days", "mini_enabled", "theme",
                    "cd2_mode", "cd2_host", "cd2_port", "cd2_root", "cd2_api_root"}
         allowed.update({"p115_api_interval_seconds", "cd2_api_interval_seconds", "transfer_interval_seconds"})
-        allowed.update({"transfer_timeout_seconds","distributed_transfer_enabled","tmdb_enabled","cd2_metadata_enabled"})
+        allowed.update({"transfer_timeout_seconds","relay_stabilize_seconds","distributed_transfer_enabled","tmdb_enabled","cd2_metadata_enabled"})
         for key in allowed:
             if key in value: self.set(key, value[key])
         if value.get("bot_token"): self.set("bot_token", str(value["bot_token"]).strip(), True)
@@ -402,13 +404,14 @@ class Store:
         self.event("服务控制","管理员请求重启服务")
         return "服务正在重启"
 
-    def relay_candidates(self, resource_id, target_tg_id, sha1="", size=0):
+    def relay_candidates(self, resource_id, target_tg_id, sha1="", size=0, min_age_seconds=0):
+        cutoff=now()-max(0,int(min_age_seconds or 0))
         with self.lock: rows=self.db.execute("""SELECT u.tg_id,u.name,u.username,u.note,u.cookie,MAX(d.updated) updated
           FROM deliveries d JOIN users u ON u.tg_id=d.tg_id JOIN resources r ON r.id=d.resource_id
           WHERE (d.resource_id=? OR (?<>'' AND UPPER(r.sha1)=UPPER(?) AND r.size=?))
-            AND d.status='delivered' AND d.tg_id<>? AND u.enabled=1 AND u.status='active' AND u.cookie<>''
+            AND d.status='delivered' AND d.updated<=? AND d.tg_id<>? AND u.enabled=1 AND u.status='active' AND u.cookie<>''
           GROUP BY u.tg_id,u.name,u.username,u.note,u.cookie ORDER BY updated DESC""",
-          (resource_id,str(sha1 or ""),str(sha1 or ""),int(size or 0),target_tg_id)).fetchall()
+          (resource_id,str(sha1 or ""),str(sha1 or ""),int(size or 0),cutoff,target_tg_id)).fetchall()
         result=[]
         for row in rows:
             item=dict(row)
@@ -417,16 +420,18 @@ class Store:
             result.append(item)
         return result
 
-    def wake_relay_retries(self,resource_id,successful_delivery_id):
+    def wake_relay_retries(self,resource_id,successful_delivery_id,delay_seconds=0):
         stamp=now()
+        delay=max(0,int(delay_seconds or 0))
+        ready_at=stamp+delay if delay else 0
         with self.lock,self.db:
-            changed=self.db.execute("""UPDATE deliveries SET status='retry',next_attempt=0,updated=?,
+            changed=self.db.execute("""UPDATE deliveries SET status='retry',next_attempt=?,updated=?,
               attempts=CASE WHEN status='failed' THEN 0 ELSE attempts END,
-              error=CASE WHEN error='' THEN '已有其他账号接收成功，立即尝试接力秒传'
-                ELSE error||'；已有其他账号接收成功，立即尝试接力秒传' END
+              error=CASE WHEN error='' THEN '已有其他账号接收成功，等待文件位置稳定后尝试接力秒传'
+                ELSE error||'；已有其他账号接收成功，等待文件位置稳定后尝试接力秒传' END
               WHERE resource_id IN (SELECT candidate.id FROM resources candidate JOIN resources source
                 ON source.id=? AND (candidate.id=source.id OR (source.sha1<>'' AND UPPER(candidate.sha1)=UPPER(source.sha1) AND candidate.size=source.size)))
-                AND id<>? AND status IN ('retry','failed')""",(stamp,resource_id,successful_delivery_id)).rowcount
+                AND id<>? AND status IN ('retry','failed')""",(ready_at,stamp,resource_id,successful_delivery_id)).rowcount
         return changed
 
     def resource_action(self, value):
@@ -1163,6 +1168,12 @@ class Application:
         return text[:500]
 
     @staticmethod
+    def file_missing_error(exc):
+        if isinstance(exc,FileNotFoundError): return True
+        text=str(exc).lower()
+        return any(marker in text for marker in ("不存在或已经删除","文件不存在","文件已删除","file not found","no such file"))
+
+    @staticmethod
     def timed_call(callback, timeout_seconds):
         result={}; finished=threading.Event()
         def worker():
@@ -1177,6 +1188,7 @@ class Application:
 
     def transfer_delivery(self,cfg,item,target_cookie):
         timeout=max(30,min(3600,int(cfg.get("transfer_timeout_seconds") or 300)))
+        stabilize=max(0,min(300,int(cfg.get("relay_stabilize_seconds") or 0)))
         deadline=time.monotonic()+timeout
         def remaining_timeout():
             remaining=deadline-time.monotonic()
@@ -1184,18 +1196,36 @@ class Application:
             return remaining
         target_label=self.user_label(item)
         relay_errors=[]
+
+        def transfer_from_account(source_cookie,source_label):
+            """Resolve by SHA1 immediately before transfer and recover one move race."""
+            last_error=None
+            for attempt in range(2):
+                fresh=P115.find_file(source_cookie,item)
+                if not fresh:
+                    last_error=FileNotFoundError(f"{source_label}中未找到文件，可能已被删除")
+                else:
+                    fresh["name"]=item["name"]
+                    try:
+                        return P115.transfer(source_cookie,target_cookie,fresh,item["target_cid"])
+                    except Exception as exc:
+                        last_error=exc
+                        if not self.file_missing_error(exc): raise
+                if attempt == 0:
+                    # The organizer can move the file between SHA1 lookup and
+                    # download_url. Re-query instead of retaining stale IDs.
+                    time.sleep(1)
+            raise last_error
+
         if cfg.get("distributed_transfer_enabled"):
-            for relay in self.store.relay_candidates(item["resource_id"],item["tg_id"],item.get("sha1"),item.get("size")):
+            for relay in self.store.relay_candidates(item["resource_id"],item["tg_id"],item.get("sha1"),item.get("size"),stabilize):
                 relay_label=self.user_label(relay)
                 failure_key=(str(item.get("sha1") or item["resource_id"]).upper(),int(relay["tg_id"]))
                 if self.relay_failures.get(failure_key,0)>now():
                     continue
                 try:
-                    def relay_action(relay=relay):
-                        relay_entry=P115.find_file(relay["cookie"],item)
-                        if not relay_entry: raise FileNotFoundError("成功账号中未找到文件，可能已删除或改名")
-                        relay_entry["name"]=item["name"]
-                        return P115.transfer(relay["cookie"],target_cookie,relay_entry,item["target_cid"])
+                    def relay_action(relay=relay,relay_label=relay_label):
+                        return transfer_from_account(relay["cookie"],relay_label)
                     self.timed_call(relay_action,remaining_timeout())
                     self.store.event("接力秒传",f"{relay_label} → {target_label}：{item['name']} 成功",item["id"])
                     self.relay_failures.pop(failure_key,None)
@@ -1211,7 +1241,10 @@ class Application:
         if relay_errors:
             self.store.event("接力回退",f"{target_label}：接力账号均不可用，改用源账号；{item['name']}",item["id"])
         try:
-            self.timed_call(lambda:P115.transfer(source_cookie,target_cookie,item,item["target_cid"]),remaining_timeout())
+            # The source file may also have moved since the scan, so refresh
+            # its node_id and pickcode by SHA1 before falling back to it.
+            source_action=(lambda:transfer_from_account(source_cookie,"主源账号")) if cfg.get("distributed_transfer_enabled") else (lambda:P115.transfer(source_cookie,target_cookie,item,item["target_cid"]))
+            self.timed_call(source_action,remaining_timeout())
             return "主源账号" if not relay_errors else "主源回退"
         except Exception as exc:
             error=self.transfer_error(exc)
@@ -1687,9 +1720,10 @@ class Application:
             target_label=self.user_label(item)
             self.store.event("派送",f"{target_label}：{item['name']}；来源 {transfer_source}；落盘 {delivery_path}",item["id"])
             if cfg.get("distributed_transfer_enabled"):
-                woken=self.store.wake_relay_retries(item["resource_id"],item["id"])
+                stabilize=max(0,min(300,int(cfg.get("relay_stabilize_seconds") or 0)))
+                woken=self.store.wake_relay_retries(item["resource_id"],item["id"],stabilize)
                 if woken:
-                    self.store.event("接力唤醒",f"{target_label} 已接收成功，立即唤醒 {woken} 个错误任务：{item['name']}",item["id"])
+                    self.store.event("接力唤醒",f"{target_label} 已接收成功，{stabilize} 秒后唤醒 {woken} 个错误任务：{item['name']}",item["id"])
             try: self.notify_delivery_success(cfg,item)
             except Exception as notify_exc:
                 self.store.event("通知失败",f"{target_label}：{item['name']}；{redact_sensitive_text(notify_exc)}",item["id"])

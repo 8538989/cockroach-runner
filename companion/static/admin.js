@@ -108,6 +108,7 @@ function renderSettings(config = {}) {
   $('cd2ApiInterval').value = config.cd2_api_interval_seconds ?? 1
   $('transferInterval').value = config.transfer_interval_seconds ?? 3
   $('transferTimeout').value = config.transfer_timeout_seconds ?? 300
+  $('relayStabilize').value = config.relay_stabilize_seconds ?? 12
   $('distributedTransfer').checked = Boolean(config.distributed_transfer_enabled)
   $('cd2MetadataEnabled').checked = Boolean(config.cd2_metadata_enabled)
   $('tmdbEnabled').checked = Boolean(config.tmdb_enabled)
@@ -404,6 +405,7 @@ $('save').addEventListener('click', () => perform(async () => {
     cd2_api_interval_seconds: Number($('cd2ApiInterval').value || 0),
     transfer_interval_seconds: Number($('transferInterval').value || 0),
     transfer_timeout_seconds: Number($('transferTimeout').value || 300),
+    relay_stabilize_seconds: Number($('relayStabilize').value || 0),
     distributed_transfer_enabled: $('distributedTransfer').checked,
     cd2_metadata_enabled: $('cd2MetadataEnabled').checked,
     tmdb_enabled: $('tmdbEnabled').checked,
