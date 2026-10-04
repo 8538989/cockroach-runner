@@ -186,54 +186,6 @@ class ScanTests(unittest.TestCase):
                 service.P115.find_file, service.P115.transfer, service.time.monotonic = original_find, original_transfer, original_monotonic
                 store.db.close()
 
-    def test_errno_61_uses_real_upload_to_create_seed(self):
-        with tempfile.TemporaryDirectory() as data_dir:
-            store = service.Store(data_dir, Fernet.generate_key().decode())
-            store.set("source_cookie", "MAIN-CK", True)
-            app = service.Application(store)
-            item = {"id": "target", "resource_id": "r", "tg_id": 2, "source_id": "legacy", "target_cid": "99",
-                    "name": "Seed.mp4", "node_id": "10", "pickcode": "pc", "sha1": "ABC", "size": 100,
-                    "is_dir": 0, "user_name": "目标用户", "username": "", "note": ""}
-            calls = []
-            original_transfer, original_sample = service.P115.transfer, service.P115.transfer_sample
-            try:
-                service.P115.transfer = staticmethod(lambda *_args: (_ for _ in ()).throw(OSError(61, "rejected")))
-                service.P115.transfer_sample = staticmethod(lambda *args: calls.append(args))
-                app.timed_call = lambda callback, _timeout: callback()
-                cfg = store.config(True); cfg.update({"resource_fallback_enabled": True, "transfer_timeout_seconds": 300})
-                self.assertEqual(app.transfer_delivery(cfg, item, "TARGET-CK"), "真实上传种子")
-                self.assertEqual(calls[0][0:2], ("MAIN-CK", "TARGET-CK"))
-                kinds = [row[0] for row in store.db.execute("SELECT kind FROM events ORDER BY created")]
-                self.assertIn("真实上传兜底", kinds)
-                self.assertIn("真实上传种子", kinds)
-            finally:
-                service.P115.transfer, service.P115.transfer_sample = original_transfer, original_sample
-                store.db.close()
-
-    def test_two_resource_rejections_pause_remaining_targets(self):
-        with tempfile.TemporaryDirectory() as data_dir:
-            store = service.Store(data_dir, Fernet.generate_key().decode())
-            stamp = service.now()
-            with store.db:
-                store.db.execute("INSERT INTO resources(id,node_id,name,first_seen) VALUES('r','1','Blocked.mp4',?)", (stamp,))
-                for tg_id in (1, 2, 3):
-                    store.db.execute("INSERT INTO users(tg_id,created,updated) VALUES(?,?,?)", (tg_id, stamp, stamp))
-                store.db.execute("INSERT INTO deliveries(id,resource_id,tg_id,status,error,created,updated) VALUES('d1','r',1,'retry',?,?,?)",
-                                 (service.RESOURCE_REJECTION_ERROR, stamp, stamp))
-                store.db.execute("INSERT INTO deliveries(id,resource_id,tg_id,status,error,created,updated) VALUES('d2','r',2,'retry',?,?,?)",
-                                 (service.RESOURCE_REJECTION_ERROR, stamp, stamp))
-                store.db.execute("INSERT INTO deliveries(id,resource_id,tg_id,status,created,updated) VALUES('d3','r',3,'waiting',?,?)", (stamp, stamp))
-            app = service.Application(store)
-            cfg = store.config(True); cfg.update({"resource_fallback_enabled": True, "resource_cooldown_minutes": 360})
-            app.deliver_one(cfg, {"id": "d3", "resource_id": "r", "name": "Blocked.mp4"})
-            row = store.db.execute("SELECT status,next_attempt,error FROM deliveries WHERE id='d3'").fetchone()
-            self.assertEqual(row["status"], "retry")
-            self.assertGreaterEqual(row["next_attempt"], stamp + 359 * 60)
-            self.assertIn("两个不同账号", row["error"])
-            event = store.db.execute("SELECT message FROM events WHERE kind='资源级暂停'").fetchone()
-            self.assertIn("Blocked.mp4", event["message"])
-            store.db.close()
-
     def test_successful_recipient_wakes_retry_and_failed_peers_for_relay(self):
         with tempfile.TemporaryDirectory() as data_dir:
             store = service.Store(data_dir, Fernet.generate_key().decode())

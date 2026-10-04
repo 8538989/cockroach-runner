@@ -35,8 +35,6 @@ QR_LOGIN_APPS = {
     "wechatmini": "115生活（微信小程序）",
     "harmony": "115生活（鸿蒙端）",
 }
-RESOURCE_REJECTION_ERROR = "该资源秒传初始化被拒绝（Errno 61）"
-SAMPLE_UPLOAD_LIMIT = 5 * 1024 ** 3
 
 
 def now(): return int(time.time())
@@ -179,8 +177,6 @@ class Store:
             "transfer_interval_seconds": self.get("transfer_interval_seconds", 3),
             "transfer_timeout_seconds": self.get("transfer_timeout_seconds", 300),
             "distributed_transfer_enabled": self.get("distributed_transfer_enabled", False),
-            "resource_fallback_enabled": self.get("resource_fallback_enabled", True),
-            "resource_cooldown_minutes": self.get("resource_cooldown_minutes", 360),
             "tmdb_enabled": self.get("tmdb_enabled", False),
             "tmdb_configured": bool(self.get("tmdb_api_key", "")),
         }
@@ -197,12 +193,11 @@ class Store:
         for key in ("p115_api_interval_seconds", "cd2_api_interval_seconds", "transfer_interval_seconds"):
             if key in value: value[key] = max(0.0, min(3600.0, float(value[key])))
         if "transfer_timeout_seconds" in value: value["transfer_timeout_seconds"] = max(30, min(3600, int(value["transfer_timeout_seconds"])))
-        if "resource_cooldown_minutes" in value: value["resource_cooldown_minutes"] = max(15, min(10080, int(value["resource_cooldown_minutes"])))
         allowed = {"public_url", "source_cid", "scan_seconds", "enabled", "default_category", "concurrency",
                    "check_hours", "retry_minutes", "max_attempts", "search_limit", "log_days", "mini_enabled", "theme",
                    "cd2_mode", "cd2_host", "cd2_port", "cd2_root", "cd2_api_root"}
         allowed.update({"p115_api_interval_seconds", "cd2_api_interval_seconds", "transfer_interval_seconds"})
-        allowed.update({"transfer_timeout_seconds","distributed_transfer_enabled","resource_fallback_enabled","resource_cooldown_minutes","tmdb_enabled"})
+        allowed.update({"transfer_timeout_seconds","distributed_transfer_enabled","tmdb_enabled"})
         for key in allowed:
             if key in value: self.set(key, value[key])
         if value.get("bot_token"): self.set("bot_token", str(value["bot_token"]).strip(), True)
@@ -425,22 +420,6 @@ class Store:
                 ELSE error||'；已有其他账号接收成功，立即尝试接力秒传' END
               WHERE resource_id=? AND id<>? AND status IN ('retry','failed')""",(stamp,resource_id,successful_delivery_id)).rowcount
         return changed
-
-    def resource_rejection_count(self,resource_id,since):
-        with self.lock:
-            delivered=self.db.execute("SELECT 1 FROM deliveries WHERE resource_id=? AND status='delivered' LIMIT 1",(resource_id,)).fetchone()
-            if delivered: return 0
-            return int(self.db.execute("""SELECT COUNT(DISTINCT tg_id) FROM deliveries
-              WHERE resource_id=? AND updated>=? AND error LIKE ?""",
-              (resource_id,int(since),RESOURCE_REJECTION_ERROR+"%")).fetchone()[0])
-
-    def defer_resource_deliveries(self,resource_id,until,reason):
-        stamp=now()
-        with self.lock,self.db:
-            return self.db.execute("""UPDATE deliveries SET status='retry',next_attempt=MAX(next_attempt,?),updated=?,
-              error=CASE WHEN error LIKE ? THEN error ELSE ? END
-              WHERE resource_id=? AND status IN ('waiting','retry')""",
-              (int(until),stamp,RESOURCE_REJECTION_ERROR+"%",str(reason)[:500],resource_id)).rowcount
 
     def resource_action(self, value):
         rid=str(value.get("id") or ""); action=str(value.get("action") or "")
@@ -837,70 +816,6 @@ class P115:
         return None
 
     @staticmethod
-    def range_reader(source, entry):
-        url = source.download_url(entry["pickcode"])
-
-        class RangeReader:
-            def __init__(self, source_url, name, size):
-                self.url = str(source_url)
-                self.headers = dict(getattr(source_url, "headers", None) or {})
-                self.name = name
-                self.size = int(size)
-                self.position = 0
-
-            def seek(self, offset, whence=0):
-                if whence == 0:
-                    position = offset
-                elif whence == 1:
-                    position = self.position + offset
-                elif whence == 2:
-                    position = self.size + offset
-                else:
-                    raise ValueError(f"unsupported whence: {whence}")
-                self.position = max(0, int(position))
-                return self.position
-
-            def tell(self):
-                return self.position
-
-            def read(self, length=-1):
-                if length is None or length < 0:
-                    length = self.size - self.position
-                if length <= 0:
-                    return b""
-                start = self.position
-                end = min(self.size - 1, start + int(length) - 1)
-                headers = {**self.headers, "Range": f"bytes={start}-{end}", "Accept-Encoding": "identity"}
-                request = urllib.request.Request(self.url, headers=headers)
-                with urllib.request.urlopen(request, timeout=30) as response:
-                    data = response.read(end - start + 1)
-                self.position += len(data)
-                return data
-
-        return RangeReader(url, entry["name"], entry["size"])
-
-    @staticmethod
-    def transfer_sample(source_cookie, user_cookie, entry, target_cid):
-        from p115client import P115Client
-        if int(entry["size"]) >= SAMPLE_UPLOAD_LIMIT:
-            raise RuntimeError("真实数据上传兜底仅支持小于 5GB 的文件")
-        source = P115Client(P115.cookie_mapping(source_cookie))
-        target = P115Client(P115.cookie_mapping(user_cookie))
-        reader = P115.range_reader(source, entry)
-        result = target.upload_file_sample(reader, pid=target_cid, filename=entry["name"])
-        if isinstance(result, dict) and result.get("state") is False:
-            raise RuntimeError(result.get("error") or "115 真实数据上传失败")
-        for _ in range(20):
-            time.sleep(1)
-            if any(
-                item["name"] == entry["name"] and item["sha1"].upper() == entry["sha1"].upper()
-                and int(item["size"]) == int(entry["size"])
-                for item in P115.list_dir(user_cookie, target_cid)
-            ):
-                return
-        raise RuntimeError("真实数据上传返回成功，但目标目录未找到文件")
-
-    @staticmethod
     def transfer(source_cookie, user_cookie, entry, target_cid):
         from p115client import P115Client
         if entry["is_dir"]:
@@ -960,7 +875,43 @@ class P115:
                     return
             raise RuntimeError("115 账号内复制结果校验失败")
 
-        reader = P115.range_reader(source, entry)
+        url = source.download_url(entry["pickcode"])
+
+        class RangeReader:
+            def __init__(self, source_url, name, size):
+                self.url = str(source_url)
+                self.headers = dict(getattr(source_url, "headers", None) or {})
+                self.name = name
+                self.size = int(size)
+                self.position = 0
+
+            def seek(self, offset, whence=0):
+                if whence == 0:
+                    position = offset
+                elif whence == 1:
+                    position = self.position + offset
+                elif whence == 2:
+                    position = self.size + offset
+                else:
+                    raise ValueError(f"unsupported whence: {whence}")
+                self.position = max(0, int(position))
+                return self.position
+
+            def read(self, length=-1):
+                if length is None or length < 0:
+                    length = self.size - self.position
+                if length <= 0:
+                    return b""
+                start = self.position
+                end = min(self.size - 1, start + int(length) - 1)
+                headers = {**self.headers, "Range": f"bytes={start}-{end}", "Accept-Encoding": "identity"}
+                request = urllib.request.Request(self.url, headers=headers)
+                with urllib.request.urlopen(request, timeout=30) as response:
+                    data = response.read(end - start + 1)
+                self.position += len(data)
+                return data
+
+        reader = RangeReader(url, entry["name"], entry["size"])
         result = target.upload_file(reader, pid=target_cid, filesha1=entry["sha1"], filesize=entry["size"], filename=entry["name"])
         if isinstance(result, dict) and result.get("state") is False:
             raise RuntimeError(result.get("error") or "115 传输失败")
@@ -1069,8 +1020,6 @@ class Application:
         self.tmdb_cache = {}
         self.tmdb_lock = threading.Lock()
         self.delivery_lock = threading.Lock()
-        self.resource_locks = {}
-        self.resource_locks_lock = threading.Lock()
         self.cleanup_lock = threading.Lock()
         self.loop_errors = {}
         self.p115_gate = RateGate()
@@ -1111,18 +1060,13 @@ class Application:
         return str(value.get("user_name") or value.get("name") or ("@"+value["username"] if value.get("username") else "") or value.get("note") or f"用户 {value.get('tg_id','未知')}")
 
     @staticmethod
-    def is_resource_rejection(exc):
-        return "[Errno 61]" in str(exc) or RESOURCE_REJECTION_ERROR in str(exc)
-
-    @staticmethod
     def transfer_error(exc):
         if isinstance(exc,TimeoutError): return str(exc)
         payload=exc.args[0] if getattr(exc,"args",None) and isinstance(exc.args[0],dict) else None
         if payload and {"pid","filename","filesha1","user_id"}.issubset(payload):
             return f"115 秒传初始化失败（目标账号 UID {payload.get('user_id')}，可能触发风控、秒传验证未通过或接口暂时异常）"
         text=redact_sensitive_text(exc)
-        if RESOURCE_REJECTION_ERROR in text: return text[:500]
-        if "[Errno 61]" in text: return RESOURCE_REJECTION_ERROR
+        if "[Errno 61]" in text: return "115 接口暂时拒绝请求（Errno 61）"
         return text[:500]
 
     @staticmethod
@@ -1172,15 +1116,6 @@ class Application:
             self.timed_call(lambda:P115.transfer(source_cookie,target_cookie,item,item["target_cid"]),remaining_timeout())
             return "主源账号" if not relay_errors else "主源回退"
         except Exception as exc:
-            if self.is_resource_rejection(exc) and cfg.get("resource_fallback_enabled",True):
-                self.store.event("真实上传兜底",f"{target_label}：{item['name']}；秒传初始化被拒绝，开始上传一个种子副本",item["id"])
-                try:
-                    self.timed_call(lambda:P115.transfer_sample(source_cookie,target_cookie,item,item["target_cid"]),remaining_timeout())
-                    self.store.event("真实上传种子",f"{target_label}：{item['name']}；种子副本上传成功，后续账号将优先接力",item["id"])
-                    return "真实上传种子"
-                except Exception as fallback_exc:
-                    fallback_error=self.transfer_error(fallback_exc)
-                    raise RuntimeError(f"{RESOURCE_REJECTION_ERROR}；真实数据上传兜底失败：{fallback_error}") from fallback_exc
             error=self.transfer_error(exc)
             if relay_errors: error=f"接力账号均失败（{'；'.join(relay_errors)}）；主源回退失败：{error}"
             raise RuntimeError(error) from exc
@@ -1494,29 +1429,12 @@ class Application:
                 list(pool.map(lambda row:self.deliver_one(cfg,dict(row)),rows))
 
     def deliver_one(self,cfg,item):
-        resource_id=str(item.get("resource_id") or item.get("id") or "")
-        with self.resource_locks_lock:
-            resource_lock=self.resource_locks.setdefault(resource_id,threading.Lock())
-        with resource_lock:
-            return self._deliver_one(cfg,item)
-
-    def _deliver_one(self,cfg,item):
-        stamp=now()
-        with self.store.lock:
-            current=self.store.db.execute("SELECT status,next_attempt FROM deliveries WHERE id=?",(item["id"],)).fetchone()
-        if not current or current["status"] not in ("waiting","retry") or int(current["next_attempt"] or 0)>stamp: return
-        cooldown=max(15,min(10080,int(cfg.get("resource_cooldown_minutes") or 360)))
-        if cfg.get("resource_fallback_enabled",True) and self.store.resource_rejection_count(item["resource_id"],stamp-cooldown*60)>=2:
-            reason=f"该资源已被两个不同账号确认秒传失败，统一暂停 {cooldown} 分钟后再试"
-            changed=self.store.defer_resource_deliveries(item["resource_id"],stamp+cooldown*60,reason)
-            self.store.event("资源级暂停",f"{item['name']}；{reason}；延后 {changed} 个任务",item["resource_id"])
-            return
         try:
             if not self.store.get("enabled",False): return
             self.transfer_gate.wait(cfg.get("transfer_interval_seconds", 3))
             cookie = self.store.crypt.decrypt(item["cookie"].encode()).decode()
             with self.store.lock, self.store.db:
-                started=self.store.db.execute("UPDATE deliveries SET status='running',attempts=attempts+1,updated=? WHERE id=? AND status IN ('waiting','retry') AND next_attempt<=?", (now(), item["id"],now())).rowcount
+                started=self.store.db.execute("UPDATE deliveries SET status='running',attempts=attempts+1,updated=? WHERE id=? AND status IN ('waiting','retry')", (now(), item["id"])).rowcount
             if not started: return
             transfer_source=self.transfer_delivery(cfg,item,cookie)
             done=now()
@@ -1548,12 +1466,6 @@ class Application:
             target_label=self.user_label(item)
             wait_text=f"，{delay//60} 分钟后重试" if status=="retry" else "，已达到最大尝试次数"
             self.store.event("派送失败",f"{target_label}：{item['name']}；{error}{wait_text}",item["id"])
-            if error.startswith(RESOURCE_REJECTION_ERROR):
-                cooldown=max(15,min(10080,int(cfg.get("resource_cooldown_minutes") or 360)))
-                if self.store.resource_rejection_count(item["resource_id"],failed-cooldown*60)>=2:
-                    reason=f"该资源已被两个不同账号确认秒传失败，统一暂停 {cooldown} 分钟后再试"
-                    changed=self.store.defer_resource_deliveries(item["resource_id"],failed+cooldown*60,reason)
-                    self.store.event("资源级暂停",f"{item['name']}；{reason}；延后 {changed} 个任务",item["resource_id"])
 
     def cleanup(self,cfg):
         if not self.cleanup_lock.acquire(False): return
