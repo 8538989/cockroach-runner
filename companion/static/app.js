@@ -265,7 +265,7 @@ async function updateTmdbSubscription(action, mediaType, id) {
   try {
     const data = await api("/api/mini/tmdb/subscriptions", "POST", {action, media_type: mediaType, id: Number(id)});
     state.profile = data.user;
-    toast(action === "add" ? "已订阅，接收模式已切换为按 TMDB 订阅" : "已取消订阅");
+    toast(action === "add" ? (data.user.account_ready ? "已订阅，接收模式已切换为按 TMDB 订阅" : "已订阅；请先完成 CK 与接收文件夹配置后再接收") : "已取消订阅");
   } catch (error) {
     toast(error.message);
   } finally {
@@ -315,7 +315,7 @@ function home() {
     ${member.active ? "" : "<p>会员到期后自动派送已暂停，请使用新的绑定码续费。</p>"}
   </section>
   <section class="panel tmdb-subscriptions">
-    <div class="section-head"><h2>TMDB 影视订阅</h2><span class="badge ${user.mode === "tmdb" && user.enabled ? "green" : "gray"}">${user.mode === "tmdb" && user.enabled ? "订阅模式已启用" : `${subscriptions.length} 项订阅`}</span></div>
+    <div class="section-head"><h2>TMDB 影视订阅</h2><span class="badge ${user.mode === "tmdb" && user.enabled && user.account_ready ? "green" : "gray"}">${user.mode === "tmdb" && user.enabled && user.account_ready ? "订阅模式已启用" : `${subscriptions.length} 项订阅`}</span></div>
     <p class="muted">搜索电影或剧集并订阅。添加后会自动切换为“按 TMDB 订阅”，只有文件名中对应的 TMDB ID 才会派送。</p>
     <div class="tmdb-search"><input id="tmdbQuery" placeholder="搜索片名，例如：蝙蝠侠"><button class="primary" data-tmdb-search ${state.tmdbSearching ? "disabled" : ""}>${state.tmdbSearching ? "搜索中..." : "搜索"}</button></div>
     ${subscriptions.length ? `<div class="tmdb-list"><h3>我的订阅</h3>${subscriptions.map(item => tmdbCard(item, true)).join("")}</div>` : '<p class="tmdb-empty">还没有 TMDB 订阅。</p>'}
@@ -343,10 +343,10 @@ function home() {
 
 function rules() {
   const user = state.profile;
-  const selectedMode = user.enabled ? user.mode : "off";
+  const selectedMode = user.enabled && user.account_ready ? user.mode : "off";
   return shell(`<section class="panel">
     <div class="section-head"><h2>接收模式</h2><span class="badge">${modeLabels[selectedMode] || "全部接收"}</span></div>
-    <p class="muted">这些规则会用于判断监听目录里的新资源是否自动派送给你。</p>
+    <p class="muted">这些规则会用于判断监听目录里的新资源是否自动派送给你。${user.account_ready ? "" : " 请先在“我的”页面完成 CK 与非根接收文件夹配置。"}</p>
     <div class="option-grid">
       ${Object.entries(modeLabels).map(([value, label]) => `<label class="option ${selectedMode === value ? "selected" : ""}">
         <input type="radio" name="mode" value="${value}" ${selectedMode === value ? "checked" : ""}>

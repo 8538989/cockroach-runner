@@ -568,7 +568,8 @@ class Telegram:
         elif not user:
             self.send(tg_id,"尚未绑定。请发送 <code>/bind 绑定码</code>。",False)
         elif text.startswith("/status"):
-            self.send(sender["id"], f"状态：{'接收中' if user['enabled'] else '已暂停'}\n模式：{user['mode']}\n115：{'已绑定' if user['account_bound'] else '未绑定'}")
+            receiving=bool(user["enabled"] and user.get("account_ready"))
+            self.send(sender["id"], f"状态：{'接收中' if receiving else '已暂停'}\n模式：{user['mode']}\n115：{'配置完整' if user.get('account_ready') else '待完成 CK 与接收文件夹配置'}")
         elif text.startswith("/all"):
             self.app.store.save_user(sender["id"], {"mode": "all", "enabled": True})
             self.send(sender["id"], "已开启全部接收。")
