@@ -555,6 +555,23 @@ class ScanTests(unittest.TestCase):
                 app.mini_preferences(123,{"mode":"both","categories":["剧集"],"include_terms":""})
             store.db.close()
 
+    def test_admin_rule_change_uses_current_modes_and_cancels_pending(self):
+        with tempfile.TemporaryDirectory() as data_dir:
+            store=service.Store(data_dir,Fernet.generate_key().decode()); store.upsert_user(123,"admin_user","")
+            store.save_user(123,{"cookie":"CK","uid":"1","target_cid":"9","target_name":"影视","account_ready":True})
+            stamp=service.now()
+            with store.db:
+                store.db.execute("INSERT INTO resources(id,node_id,name,category,first_seen) VALUES('r','1','三体.S01E01.mkv','剧集',?)",(stamp,))
+                store.db.execute("INSERT INTO deliveries(id,resource_id,tg_id,created,updated) VALUES('d','r',123,?,?)",(stamp,stamp))
+            app=service.Application(store)
+            result=app.admin_user_save({"tg_id":123,"mode":"subscription","include_terms":"沙丘","categories":[],
+                                        "exclude_terms":"","hierarchy":False,"enabled":True,"status":"active",
+                                        "target_cid":"9","target_name":"影视"})
+            self.assertEqual((result["user"]["mode"],result["cancelled"]),("subscription",1))
+            self.assertEqual(store.db.execute("SELECT status FROM deliveries WHERE id='d'").fetchone()[0],"cancelled")
+            self.assertTrue(result["user"]["account_ready"])
+            store.db.close()
+
     def test_mini_account_is_not_ready_until_non_root_folder_is_saved(self):
         with tempfile.TemporaryDirectory() as data_dir:
             store = service.Store(data_dir, Fernet.generate_key().decode())

@@ -153,7 +153,7 @@ function renderDeliveries(items = []) {
       <td>${escapeHtml(item.user_name || item.username || item.tg_id)}</td>
       <td>${badge(item.status)}</td>
       <td>${escapeHtml(item.attempts || 0)}</td>
-      <td>${escapeHtml(formatTime(item.updated))}${item.source ? `<small>来源：${escapeHtml(item.source)}</small>` : ''}${item.error ? `<small class="danger">${escapeHtml(item.error)}</small>` : ''}</td>
+      <td>${escapeHtml(formatTime(item.updated))}${item.source ? `<small>来源：${escapeHtml(item.source)}</small>` : ''}${item.destination ? `<small>落盘：${escapeHtml(item.destination)}</small>` : ''}${item.error ? `<small class="danger">${escapeHtml(item.error)}</small>` : ''}</td>
       <td><div class="row-actions">
         ${canRetry ? `<button class="small-button" data-action="delivery-retry" data-id="${escapeHtml(item.id)}">重派</button>` : ''}
         ${canCancel ? `<button class="small-button danger-button" data-action="delivery-cancel" data-id="${escapeHtml(item.id)}">取消</button>` : ''}

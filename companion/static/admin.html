@@ -122,13 +122,13 @@
         <label class="field"><span>会员到期时间</span><input id="userMembershipExpires" readonly></label>
         <label class="field"><span>目标目录 CID</span><div class="input-action"><input id="userTargetCid"><button type="button" id="pickUser115">选择文件夹</button></div></label>
         <label class="field"><span>目标目录名称</span><input id="userTargetName"></label>
-        <label class="field"><span>订阅模式</span><select id="userMode"><option value="all">全部资源</option><option value="category">指定分类</option><option value="keyword">关键词</option></select></label>
+        <label class="field"><span>订阅模式</span><select id="userMode"><option value="all">全部资源</option><option value="subscription">订阅关键词</option><option value="category">指定分类</option><option value="both">关键词和分类（同时满足）</option><option value="tmdb">TMDB 精确订阅</option><option value="off">关闭接收</option></select></label>
         <label class="field"><span>分类（逗号分隔）</span><input id="userCategories"></label>
         <label class="field"><span>包含关键词</span><input id="userIncludeTerms"></label>
         <label class="field"><span>排除关键词</span><input id="userExcludeTerms"></label>
         <label class="field wide"><span>备注</span><textarea id="userNote" rows="2"></textarea></label>
       </div>
-      <div class="checks"><label class="check"><input id="userEnabled" type="checkbox"> 接收派送</label><label class="check"><input id="userHierarchy" type="checkbox"> 保留目录层级</label></div>
+      <div class="checks"><label class="check"><input id="userEnabled" type="checkbox"> 接收派送</label><label class="check"><input id="userHierarchy" type="checkbox"> 按分类建立落盘目录</label></div>
       <div class="dialog-actions"><button type="button" id="deleteUser" class="danger-button">删除用户</button><span class="action-spacer"></span><button type="button" class="close-dialog">取消</button><button type="submit" class="primary">保存用户</button></div>
     </form>
   </dialog>

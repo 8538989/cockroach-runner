@@ -1263,6 +1263,20 @@ class Application:
         cancelled=self.reconcile_user_deliveries(saved)
         self.store.event("接收规则",f"{self.user_label(saved)}：保存 {mode} 模式，取消 {cancelled} 个待派送任务",str(tg_id))
         return {"user":saved,"cancelled":cancelled}
+
+    def admin_user_save(self,value):
+        tg_id=int(value.get("tg_id") or 0)
+        result=self.mini_preferences(tg_id,value)
+        extra={key:value[key] for key in ("status","search_limit","target_cid","target_name","note","enabled","account_ready") if key in value}
+        if "target_cid" in extra or "target_name" in extra:
+            current=self.store.user(tg_id,True) or {}
+            cid=str(extra.get("target_cid",current.get("target_cid") or "0"))
+            name=str(extra.get("target_name",current.get("target_name") or "根目录"))
+            extra["account_ready"]=bool(current.get("cookie") and cid not in {"","0"} and name not in {"","根目录"})
+        saved=self.store.save_user(tg_id,extra)
+        result["cancelled"]+=self.reconcile_user_deliveries(saved)
+        result["user"]=saved
+        return result
     def mini_user(self, init_data):
         if not self.store.get("mini_enabled",True): raise PermissionError("小程序当前已停用")
         token = self.store.get("bot_token", "")
@@ -1605,7 +1619,7 @@ class Application:
     @staticmethod
     def matches(user, name, category):
         mode = user.get("mode") or "all"; lower = name.lower()
-        if mode == "off" or not bool(user.get("enabled",True)): return False
+        if mode == "off" or not bool(user.get("enabled",True)) or user.get("status","active")!="active": return False
         excluded = [x.strip().lower() for x in re.split(r"[,，;；\n]+",str(user.get("exclude_terms") or "")) if x.strip()]
         if any(x in lower for x in excluded): return False
         if mode == "all": return True
@@ -1818,7 +1832,7 @@ class Handler(BaseHTTPRequestHandler):
             if path == "/api/admin/source-browse" and method == "POST": self.admin(); return self.send_json(200,self.app.source_browse(self.body()))
             if path == "/api/admin/test-cd2" and method == "POST": self.admin(); result=CD2.test(self.app.store.config(True)); return self.send_json(200,{"message":f"CD2 连接正常，读取到 {result['count']} 个项目",**result})
             if path == "/api/admin/users" and method == "PUT":
-                self.admin(); value=self.body(); user=self.app.store.save_user(int(value.get("tg_id") or 0),value); self.app.store.event("用户管理",f"更新用户：{user.get('name') or user.get('tg_id')}",str(user["tg_id"])); return self.send_json(200,{"message":"用户设置已保存","user":user})
+                self.admin(); value=self.body(); result=self.app.admin_user_save(value); user=result["user"]; self.app.store.event("用户管理",f"更新用户：{user.get('name') or user.get('tg_id')}",str(user["tg_id"])); return self.send_json(200,{"message":"用户设置已保存",**result})
             if path == "/api/admin/users" and method == "DELETE":
                 self.admin(); value=self.body(); self.app.store.delete_user(int(value.get("tg_id") or 0)); return self.send_json(200,{"message":"用户已删除"})
             if path == "/api/admin/deliveries" and method == "POST": self.admin(); self.app.store.delivery_action(self.body()); return self.send_json(200,{"message":"派送任务已更新"})
