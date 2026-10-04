@@ -248,7 +248,11 @@ class Store:
     def save_user(self, tg_id, value):
         current = self.user(tg_id, True)
         if not current: raise ValueError("用户不存在")
-        fields = {k: value[k] for k in ("target_cid","target_name","enabled","mode","include_terms","exclude_terms","hierarchy","status","note","search_limit") if k in value}
+        fields = {k: value[k] for k in ("target_cid","target_name","enabled","include_terms","exclude_terms","hierarchy","status","note","search_limit") if k in value}
+        if "mode" in value:
+            mode=str(value.get("mode") or "all")
+            if mode not in {"all","subscription","category","both","either","off"}: raise ValueError("接收模式无效")
+            fields["mode"]=mode
         if "categories" in value: fields["categories"] = dumps(value["categories"] if isinstance(value["categories"], list) else [])
         if value.get("cookie"):
             fields["cookie"] = self.crypt.encrypt(str(value["cookie"]).strip().encode()).decode()
@@ -1028,7 +1032,7 @@ class Application:
 
     @staticmethod
     def user_label(value):
-        return str(value.get("name") or value.get("user_name") or ("@"+value["username"] if value.get("username") else "") or value.get("note") or f"用户 {value.get('tg_id','未知')}")
+        return str(value.get("user_name") or value.get("name") or ("@"+value["username"] if value.get("username") else "") or value.get("note") or f"用户 {value.get('tg_id','未知')}")
 
     @staticmethod
     def transfer_error(exc):
@@ -1049,7 +1053,7 @@ class Application:
             finally: finished.set()
         threading.Thread(target=worker,daemon=True,name="transfer-call").start()
         timeout=max(0.1,min(3600.0,float(timeout_seconds or 300)))
-        if not finished.wait(timeout): raise TimeoutError(f"秒传超过 {timeout} 秒，任务已暂停并等待稍后重试")
+        if not finished.wait(timeout): raise TimeoutError(f"秒传超过 {timeout:.0f} 秒，任务已暂停并等待稍后重试")
         if "error" in result: raise result["error"]
         return result.get("value")
 
@@ -1309,14 +1313,19 @@ class Application:
     @staticmethod
     def matches(user, name, category):
         mode = user.get("mode") or "all"; lower = name.lower()
-        excluded = [x.strip().lower() for x in str(user.get("exclude_terms") or "").split(",") if x.strip()]
+        if mode == "off" or not bool(user.get("enabled",True)): return False
+        excluded = [x.strip().lower() for x in re.split(r"[,，;；\n]+",str(user.get("exclude_terms") or "")) if x.strip()]
         if any(x in lower for x in excluded): return False
         if mode == "all": return True
         categories = json.loads(user.get("categories") or "[]")
         cat_ok = category in categories
-        terms = [x.strip().lower() for x in str(user.get("include_terms") or "").split(",") if x.strip()]
+        terms = [x.strip().lower() for x in re.split(r"[,，;；\n]+",str(user.get("include_terms") or "")) if x.strip()]
         term_ok = bool(terms) and any(x in lower for x in terms)
-        return cat_ok if mode == "category" else term_ok if mode == "subscription" else cat_ok or term_ok
+        if mode == "category": return cat_ok
+        if mode == "subscription": return term_ok
+        if mode == "both": return cat_ok and term_ok
+        if mode == "either": return cat_ok or term_ok
+        return False
 
     def deliver(self, cfg):
         if not self.delivery_lock.acquire(False): return

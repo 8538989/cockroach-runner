@@ -215,6 +215,9 @@ class ScanTests(unittest.TestCase):
         self.assertIn("UID 9", text)
         self.assertNotIn("SECRET", text)
 
+    def test_delivery_log_prefers_user_name_over_resource_name(self):
+        self.assertEqual(service.Application.user_label({"name": "Resource.mkv", "user_name": "小明", "tg_id": 1}), "小明")
+
     def test_source_can_use_its_own_encrypted_115_cookie(self):
         with tempfile.TemporaryDirectory() as data_dir:
             store = service.Store(data_dir, Fernet.generate_key().decode())
@@ -443,6 +446,17 @@ class ScanTests(unittest.TestCase):
             app.queue_resource("expired-resource", "Expired.mkv", "电影", stamp)
             self.assertEqual(store.db.execute("SELECT COUNT(*) FROM deliveries WHERE tg_id=123").fetchone()[0], 0)
             store.db.close()
+
+    def test_receive_rule_modes_match_keywords_categories_and_off(self):
+        base = {"enabled": 1, "categories": '["剧集"]', "include_terms": "三体，沙丘;基地", "exclude_terms": "预告；花絮"}
+        self.assertTrue(service.Application.matches({**base, "mode": "subscription"}, "三体.2026.S01E01.mkv", "剧集"))
+        self.assertFalse(service.Application.matches({**base, "mode": "subscription"}, "三体.2026.预告.mkv", "剧集"))
+        self.assertTrue(service.Application.matches({**base, "mode": "category"}, "任意节目.mkv", "剧集"))
+        self.assertFalse(service.Application.matches({**base, "mode": "category"}, "任意电影.mkv", "电影"))
+        self.assertTrue(service.Application.matches({**base, "mode": "both"}, "沙丘.S01E01.mkv", "剧集"))
+        self.assertFalse(service.Application.matches({**base, "mode": "both"}, "沙丘.2026.mkv", "电影"))
+        self.assertFalse(service.Application.matches({**base, "mode": "off"}, "三体.S01E01.mkv", "剧集"))
+        self.assertFalse(service.Application.matches({**base, "mode": "all", "enabled": 0}, "任意.mkv", "电影"))
 
     def test_membership_renewal_extends_from_current_expiry(self):
         with tempfile.TemporaryDirectory() as data_dir:

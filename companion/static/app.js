@@ -20,7 +20,7 @@ const state = {
 let qrTimer = null;
 
 const pages = [["home", "首页"], ["rules", "接收"], ["records", "记录"], ["account", "我的"]];
-const modeLabels = { all: "全部接收", subscription: "按订阅关键词", category: "按分类", either: "订阅或分类" };
+const modeLabels = { all: "全部接收", subscription: "按订阅关键词", category: "按分类", both: "订阅和分类", off: "关闭接收" };
 const statusLabels = { waiting: "等待中", running: "派送中", retry: "重试中", delivered: "已完成", cancelled: "已取消", failed: "失败" };
 
 const esc = (value) => String(value ?? "").replace(/[&<>"']/g, (char) => ({
@@ -99,10 +99,12 @@ function accountValues() {
 }
 
 async function savePreferences() {
+  const preferences = ruleValues();
+  preferences.enabled = preferences.mode !== "off";
   state.saving = true;
   render();
   try {
-    const data = await api("/api/mini/preferences", "PUT", ruleValues());
+    const data = await api("/api/mini/preferences", "PUT", preferences);
     state.profile = data.user;
     toast("接收设置已保存");
   } catch (error) {
@@ -119,10 +121,11 @@ async function bindAccount() {
     toast("请先填写 115 Cookie");
     return;
   }
+  const target = accountValues();
   state.saving = true;
   render();
   try {
-    const data = await api("/api/mini/account", "PUT", { ...accountValues(), cookie });
+    const data = await api("/api/mini/account", "PUT", { ...target, cookie });
     state.profile = data.user;
     toast(`CK 已验证并保存：${data.account?.name || data.account?.uid || "115账号"}`);
   } catch (error) {
@@ -283,12 +286,13 @@ function home() {
 
 function rules() {
   const user = state.profile;
+  const selectedMode = user.enabled ? user.mode : "off";
   return shell(`<section class="panel">
-    <div class="section-head"><h2>接收模式</h2><span class="badge">${modeLabels[user.mode] || "全部接收"}</span></div>
+    <div class="section-head"><h2>接收模式</h2><span class="badge">${modeLabels[selectedMode] || "全部接收"}</span></div>
     <p class="muted">这些规则会用于判断监听目录里的新资源是否自动派送给你。</p>
     <div class="option-grid">
-      ${Object.entries(modeLabels).map(([value, label]) => `<label class="option ${user.mode === value ? "selected" : ""}">
-        <input type="radio" name="mode" value="${value}" ${user.mode === value ? "checked" : ""}>
+      ${Object.entries(modeLabels).map(([value, label]) => `<label class="option ${selectedMode === value ? "selected" : ""}">
+        <input type="radio" name="mode" value="${value}" ${selectedMode === value ? "checked" : ""}>
         <span>${label}</span>
       </label>`).join("")}
     </div>
@@ -303,7 +307,7 @@ function rules() {
     </div>
     <label class="field"><span>订阅关键词，逗号分隔</span><input id="include" value="${esc(user.include_terms)}" placeholder="例如：三体, 沙丘"></label>
     <label class="field"><span>排除关键词，逗号分隔</span><input id="exclude" value="${esc(user.exclude_terms)}" placeholder="例如：预告, 花絮"></label>
-    <label class="switch-row"><span><strong>启用自动派送</strong><small>关闭后会保留账号和规则，但不再接收新任务。</small></span><input id="enabled" type="checkbox" ${user.enabled ? "checked" : ""}></label>
+    <p class="muted">选择“关闭接收”后会保留账号和规则，但不会再生成新的派送任务。</p>
     <label class="switch-row"><span><strong>按分类建立层级目录</strong></span><input id="hierarchy" type="checkbox" ${user.hierarchy ? "checked" : ""}></label>
     <button class="primary full" data-save ${state.saving ? "disabled" : ""}>${state.saving ? "正在保存..." : "保存接收设置"}</button>
   </section>`);
