@@ -1,5 +1,6 @@
 import sys
 import tempfile
+import types
 import unittest
 from pathlib import Path
 
@@ -288,6 +289,29 @@ class ScanTests(unittest.TestCase):
             self.assertGreaterEqual(row["next_attempt"], stamp + 12)
             self.assertIn("等待文件位置稳定", row["error"])
             store.db.close()
+
+    def test_target_global_sha1_confirms_success_after_organizer_moves_copied_file(self):
+        entry = {"node_id": "source", "name": "Moved.mkv", "pickcode": "pc", "sha1": "ABC", "size": 100, "is_dir": False}
+        copy_calls = []
+        class FakeClient:
+            def __init__(self, cookie): self.cookie = cookie
+            def fs_copy(self, node_id, pid):
+                copy_calls.append((node_id, pid))
+                return {"state": True}
+        fake_module = types.SimpleNamespace(P115Client=FakeClient)
+        original_module = sys.modules.get("p115client")
+        original_list, original_find, original_sleep = service.P115.list_dir, service.P115._find_file_client, service.time.sleep
+        try:
+            sys.modules["p115client"] = fake_module
+            service.P115.list_dir = staticmethod(lambda cookie, cid: [])
+            service.P115._find_file_client = staticmethod(lambda client, expected: {**entry, "node_id": "organized-copy"})
+            service.time.sleep = lambda seconds: None
+            self.assertIsNone(service.P115.transfer("UID=source", "UID=target", entry, "99"))
+            self.assertEqual(copy_calls, [("organized-copy", "99")])
+        finally:
+            if original_module is None: sys.modules.pop("p115client", None)
+            else: sys.modules["p115client"] = original_module
+            service.P115.list_dir, service.P115._find_file_client, service.time.sleep = original_list, original_find, original_sleep
 
     def test_successful_recipient_wakes_retry_and_failed_peers_for_relay(self):
         with tempfile.TemporaryDirectory() as data_dir:

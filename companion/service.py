@@ -916,6 +916,12 @@ class P115:
                 for item in target_entries()
             )
 
+        def exists_anywhere():
+            # A media organizer may move/rename the new file immediately after
+            # it lands. In that case directory verification races the mover,
+            # while a global SHA1 lookup still proves the delivery succeeded.
+            return bool(P115._find_file_client(target,entry))
+
         if verified():
             return
 
@@ -932,6 +938,8 @@ class P115:
                 if copied:
                     break
             if not copied:
+                if exists_anywhere():
+                    return
                 raise RuntimeError("115 账号内复制后未找到目标文件")
             if copied["name"] != entry["name"]:
                 result = target.fs_rename((copied["node_id"], entry["name"]))
@@ -941,6 +949,8 @@ class P115:
                 time.sleep(1)
                 if verified():
                     return
+            if exists_anywhere():
+                return
             raise RuntimeError("115 账号内复制结果校验失败")
 
         class RangeReader:
@@ -1003,6 +1013,8 @@ class P115:
             time.sleep(1)
             if verified():
                 return
+        if exists_anywhere():
+            return
         raise RuntimeError("115 传输返回成功，但目标目录未找到文件")
 
     @staticmethod
