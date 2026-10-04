@@ -54,6 +54,44 @@ class ScanTests(unittest.TestCase):
         self.assertLess(len(service.re.sub(r"<[^>]+>", "", caption)), 1024)
         self.assertEqual(service.TMDB.poster(metadata), "https://image.tmdb.org/t/p/w780/poster.jpg")
 
+    def test_tmdb_parser_recognizes_common_episode_formats_and_ranges(self):
+        cases = (
+            ("三体.2026.S02E03.2160p.mkv", "剧集", (2, 3, 0, "三体")),
+            ("三体 第2季第3集.mp4", "剧集", (2, 3, 0, "三体")),
+            ("Three.Body.Season.2.Episode.3.mkv", "剧集", (2, 3, 0, "Three Body")),
+            ("三体.S02E03-E04.mkv", "剧集", (2, 3, 4, "三体")),
+            ("三体.EP17.mkv", "剧集", (1, 17, 0, "三体")),
+        )
+        for filename, category, expected in cases:
+            with self.subTest(filename=filename):
+                parsed=service.TMDB.parse_name(filename,category)
+                self.assertEqual((parsed["season"],parsed["episode"],parsed["episode_end"],parsed["title"]),expected)
+
+    def test_tv_caption_and_plain_fallback_show_chinese_season_episode(self):
+        item={"id":"d","tg_id":123,"name":"三体.2026.S02E03-E04.2160p.mkv","size":100,"category":"剧集"}
+        metadata={"id":100,"media_type":"tv","name":"三体","first_air_date":"2026-01-01"}
+        caption=service.TMDB.caption(item,metadata)
+        self.assertIn("第2季 · 第3-4集",caption)
+        self.assertIn("├ 季集 第2季 · 第3-4集",caption)
+        with tempfile.TemporaryDirectory() as data_dir:
+            store=service.Store(data_dir,Fernet.generate_key().decode()); app=service.Application(store); calls=[]
+            app.telegram.send=lambda chat_id,text,webapp: calls.append((chat_id,text,webapp))
+            app.notify_delivery_success({"tmdb_enabled":False,"tmdb_api_key":""},item)
+            self.assertIn("📺 第2季 · 第3-4集",calls[0][1])
+            store.db.close()
+
+    def test_sha1_lookup_is_used_before_filename_search(self):
+        class Client:
+            def __init__(self): self.search_calls=0
+            def fs_shasearch(self,sha1,**_kwargs):
+                return {"state":True,"data":{"file_id":"88","pick_code":"pc","file_name":"renamed.mkv","sha1":sha1,"file_size":100}}
+            def fs_search(self,*_args,**_kwargs):
+                self.search_calls+=1; return {"data":[]}
+        client=Client(); entry={"name":"original.mkv","sha1":"ABC","size":100}
+        found=service.P115._find_file_client(client,entry)
+        self.assertEqual((found["node_id"],found["pickcode"],found["name"]),("88","pc","renamed.mkv"))
+        self.assertEqual(client.search_calls,0)
+
     def test_tmdb_api_key_is_encrypted_and_hidden_from_public_config(self):
         with tempfile.TemporaryDirectory() as data_dir:
             store = service.Store(data_dir, Fernet.generate_key().decode())
@@ -207,6 +245,22 @@ class ScanTests(unittest.TestCase):
             self.assertEqual((failed["status"], failed["attempts"], failed["next_attempt"]), ("retry", 0, 0))
             self.assertIn("立即尝试接力秒传", failed["error"])
             self.assertEqual(cancelled["status"], "cancelled")
+            store.db.close()
+
+    def test_relay_pool_matches_same_sha1_across_different_resource_records(self):
+        with tempfile.TemporaryDirectory() as data_dir:
+            store=service.Store(data_dir,Fernet.generate_key().decode()); stamp=service.now()
+            store.upsert_user(1,"relay",""); store.save_user(1,{"cookie":"RELAY-CK","uid":"relay"})
+            store.upsert_user(2,"target",""); store.save_user(2,{"cookie":"TARGET-CK","uid":"target"})
+            with store.db:
+                store.db.execute("INSERT INTO resources(id,node_id,name,sha1,size,first_seen) VALUES('old','1','old-name.mkv','ABC',100,?)",(stamp,))
+                store.db.execute("INSERT INTO resources(id,node_id,name,sha1,size,first_seen) VALUES('new','2','new-name.mkv','abc',100,?)",(stamp,))
+                store.db.execute("INSERT INTO deliveries(id,resource_id,tg_id,status,created,updated) VALUES('done','old',1,'delivered',?,?)",(stamp,stamp))
+                store.db.execute("INSERT INTO deliveries(id,resource_id,tg_id,status,created,updated) VALUES('retry','new',2,'retry',?,?)",(stamp,stamp))
+            candidates=store.relay_candidates("new",2,"ABC",100)
+            self.assertEqual([item["tg_id"] for item in candidates],[1])
+            self.assertEqual(store.wake_relay_retries("old","done"),1)
+            self.assertEqual(store.db.execute("SELECT next_attempt FROM deliveries WHERE id='retry'").fetchone()[0],0)
             store.db.close()
 
     def test_transfer_error_hides_115_user_key(self):

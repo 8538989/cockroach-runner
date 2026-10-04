@@ -398,11 +398,13 @@ class Store:
         self.event("服务控制","管理员请求重启服务")
         return "服务正在重启"
 
-    def relay_candidates(self, resource_id, target_tg_id):
-        with self.lock: rows=self.db.execute("""SELECT u.tg_id,u.name,u.username,u.note,u.cookie,d.updated
-          FROM deliveries d JOIN users u ON u.tg_id=d.tg_id
-          WHERE d.resource_id=? AND d.status='delivered' AND d.tg_id<>? AND u.enabled=1 AND u.status='active' AND u.cookie<>''
-          ORDER BY d.updated DESC""",(resource_id,target_tg_id)).fetchall()
+    def relay_candidates(self, resource_id, target_tg_id, sha1="", size=0):
+        with self.lock: rows=self.db.execute("""SELECT u.tg_id,u.name,u.username,u.note,u.cookie,MAX(d.updated) updated
+          FROM deliveries d JOIN users u ON u.tg_id=d.tg_id JOIN resources r ON r.id=d.resource_id
+          WHERE (d.resource_id=? OR (?<>'' AND UPPER(r.sha1)=UPPER(?) AND r.size=?))
+            AND d.status='delivered' AND d.tg_id<>? AND u.enabled=1 AND u.status='active' AND u.cookie<>''
+          GROUP BY u.tg_id,u.name,u.username,u.note,u.cookie ORDER BY updated DESC""",
+          (resource_id,str(sha1 or ""),str(sha1 or ""),int(size or 0),target_tg_id)).fetchall()
         result=[]
         for row in rows:
             item=dict(row)
@@ -418,7 +420,9 @@ class Store:
               attempts=CASE WHEN status='failed' THEN 0 ELSE attempts END,
               error=CASE WHEN error='' THEN '已有其他账号接收成功，立即尝试接力秒传'
                 ELSE error||'；已有其他账号接收成功，立即尝试接力秒传' END
-              WHERE resource_id=? AND id<>? AND status IN ('retry','failed')""",(stamp,resource_id,successful_delivery_id)).rowcount
+              WHERE resource_id IN (SELECT candidate.id FROM resources candidate JOIN resources source
+                ON source.id=? AND (candidate.id=source.id OR (source.sha1<>'' AND UPPER(candidate.sha1)=UPPER(source.sha1) AND candidate.size=source.size)))
+                AND id<>? AND status IN ('retry','failed')""",(stamp,resource_id,successful_delivery_id)).rowcount
         return changed
 
     def resource_action(self, value):
@@ -597,19 +601,40 @@ class TMDB:
     def parse_name(filename, category=""):
         stem = Path(str(filename)).stem
         explicit = re.search(r"\{tmdb[-_: ]?(\d+)\}", stem, re.I)
-        episode = re.search(r"(?<![A-Za-z0-9])S(\d{1,2})E(\d{1,3})(?!\d)", stem, re.I)
+        episode = None
+        for pattern in (
+            r"(?<![A-Za-z0-9])S(?:eason)?[ ._-]?(\d{1,2})[ ._-]*E(?:p(?:isode)?)?[ ._-]?(\d{1,3})(?:[ ._-]*(?:E|EP|-)[ ._-]?(\d{1,3}))?(?!\d)",
+            r"第\s*(\d{1,2})\s*季[ ._-]*第?\s*(\d{1,3})\s*集(?:\s*[-至到]\s*第?\s*(\d{1,3})\s*集)?",
+            r"(?<![A-Za-z0-9])Season[ ._-]?(\d{1,2})[ ._-]+Episode[ ._-]?(\d{1,3})(?:[ ._-]*(?:-|to)[ ._-]?(\d{1,3}))?(?!\d)",
+        ):
+            episode = re.search(pattern, stem, re.I)
+            if episode: break
+        episode_only = None
+        if not episode and str(category) in {"剧集", "电视剧", "综艺", "动漫"}:
+            episode_only = re.search(r"(?<![A-Za-z0-9])(?:EP?|第)[ ._-]?(\d{1,3})(?:[ ._-]*(?:集|END))?(?!\d)", stem, re.I)
         year_match = re.search(r"(?<!\d)((?:19|20)\d{2})(?!\d)", stem)
-        media_type = "tv" if episode or str(category) in {"剧集", "电视剧", "综艺", "动漫"} else "movie"
-        title = stem[:episode.start()] if episode else stem
+        media_type = "tv" if episode or episode_only or str(category) in {"剧集", "电视剧", "综艺", "动漫"} else "movie"
+        marker = episode or episode_only
+        title = stem[:marker.start()] if marker else stem
         title = re.sub(r"\{(?:tmdb|imdb)[^}]*\}", " ", title, flags=re.I)
         title = re.sub(r"[\[(（]?(?:19|20)\d{2}[\])）]?", " ", title)
         title = re.split(r"(?i)(?:\b(?:2160p|1080p|720p|4k|8k|web[- .]?dl|bluray|blu[- .]?ray|remux|hdtv)\b)", title, maxsplit=1)[0]
         title = re.sub(r"[._]+", " ", title)
         title = re.sub(r"\s*[-–—]+\s*$", "", title)
         title = re.sub(r"\s+", " ", title).strip(" -–—[]()（）")
+        season = int(episode.group(1)) if episode else (1 if episode_only else 0)
+        episode_number = int(episode.group(2)) if episode else (int(episode_only.group(1)) if episode_only else 0)
+        episode_end = int(episode.group(3)) if episode and episode.lastindex and episode.lastindex >= 3 and episode.group(3) else 0
         return {"title": title or stem, "year": int(year_match.group(1)) if year_match else 0,
                 "media_type": media_type, "tmdb_id": int(explicit.group(1)) if explicit else 0,
-                "season": int(episode.group(1)) if episode else 0, "episode": int(episode.group(2)) if episode else 0}
+                "season": season, "episode": episode_number, "episode_end": episode_end}
+
+    @staticmethod
+    def episode_text(parsed):
+        season=int(parsed.get("season") or 0); episode=int(parsed.get("episode") or 0); episode_end=int(parsed.get("episode_end") or 0)
+        if not episode: return ""
+        episode_part=f"第{episode}集" if not episode_end or episode_end == episode else f"第{episode}-{episode_end}集"
+        return f"第{season}季 · {episode_part}" if season else episode_part
 
     @staticmethod
     def detail(api_key, media_type, tmdb_id):
@@ -708,9 +733,10 @@ class TMDB:
         tag_line=" ".join("#"+re.sub(r"[^\w\u4e00-\u9fff]+","_",value).strip("_") for value in tags if value)
         imdb=(metadata.get("external_ids") or {}).get("imdb_id") or metadata.get("imdb_id") or ""
         parsed=TMDB.parse_name(item.get("name", ""),item.get("category", ""))
-        episode_line=f" · S{parsed['season']:02d}E{parsed['episode']:02d}" if parsed["season"] else ""
+        episode_text=TMDB.episode_text(parsed)
+        episode_line=f" · {episode_text}" if episode_text else ""
         lines=["🥳 <b>派送成功</b>",f"🎬 <b>{html.escape(title)}{(' · '+year) if year else ''}{episode_line}</b>","", "🎞 <b>影片资料</b>",
-               f"├ 类型 {kind}",f'├ TMDB ID <a href="{tmdb_url}">{tmdb_id}</a>',f"├ 分类 {html.escape(category)}",
+               f"├ 类型 {kind}",*([f"├ 季集 {episode_text}"] if episode_text else []),f'├ TMDB ID <a href="{tmdb_url}">{tmdb_id}</a>',f"├ 分类 {html.escape(category)}",
                f"├ 评分 {rating:.1f} / 10",f"├ 主演 {actors}","├ 接收方式 蟑影派送",f"└ 大小 {TMDB.size_text(item.get('size',0))}","",
                "🎥 <b>影音规格</b>",html.escape(spec_text),"", "📂 <b>文件列表 · 1 项</b>",f"1. <code>{html.escape(short_name)}</code>","",f"🏷 {html.escape(tag_line)}"]
         if imdb: lines.extend(["",f'🎬 <a href="https://www.imdb.com/title/{urllib.parse.quote(str(imdb))}/">IMDb {html.escape(str(imdb))}</a>'])
@@ -796,24 +822,50 @@ class P115:
         return entries
 
     @staticmethod
-    def find_file(cookie, entry):
-        from p115client import P115Client
-        client=P115Client(P115.cookie_mapping(cookie))
+    def _file_entry(item, expected):
+        if not isinstance(item,dict): return None
+        sha1=str(item.get("sha") or item.get("sha1") or expected.get("sha1") or "").upper()
+        size=int(item.get("s") or item.get("size") or item.get("file_size") or 0)
+        node_id=str(item.get("fid") or item.get("file_id") or item.get("id") or "")
+        pickcode=str(item.get("pc") or item.get("pick_code") or item.get("pickcode") or "")
+        expected_size=int(expected.get("size") or 0)
+        if not node_id or not pickcode or sha1 != str(expected.get("sha1") or "").upper(): return None
+        if size and expected_size and size != expected_size: return None
+        return {"node_id":node_id,"name":str(item.get("n") or item.get("fn") or item.get("file_name") or item.get("name") or expected.get("name") or ""),
+                "is_dir":False,"pickcode":pickcode,"sha1":sha1,"size":size or expected_size}
+
+    @staticmethod
+    def _find_file_client(client, entry):
+        sha1=str(entry.get("sha1") or "").upper()
+        if sha1:
+            last_error=None
+            for attempt in range(3):
+                try:
+                    result=client.fs_shasearch(sha1,timeout=6)
+                    if not isinstance(result,dict) or result.get("state") is False: break
+                    found=P115._file_entry(result.get("data") or result,entry)
+                    if found: return found
+                    break
+                except Exception as exc:
+                    last_error=exc
+                    if attempt<2: time.sleep(0.4*(attempt+1))
+            if last_error and attempt == 2: raise last_error
         title=re.split(r"\.(?:19|20)\d{2}\b|\.S\d{1,2}E\d{1,3}\b",entry["name"],maxsplit=1,flags=re.I)[0]
         queries=list(dict.fromkeys(filter(None,(entry["name"],title.strip(" ._-"),Path(entry["name"]).stem))))
         for query in queries:
-            result=client.fs_search({"search_value":query,"limit":115,"offset":0,"show_dir":0})
+            result=client.fs_search({"search_value":query,"limit":115,"offset":0,"show_dir":0},timeout=8)
             data=result.get("data") if isinstance(result,dict) else None
             items=(data.get("data") or data.get("list") or []) if isinstance(data,dict) else data if isinstance(data,list) else []
             for item in items:
-                sha1=str(item.get("sha") or item.get("sha1") or "").upper()
-                size=int(item.get("s") or item.get("size") or 0)
-                node_id=str(item.get("fid") or item.get("file_id") or "")
-                pickcode=str(item.get("pc") or item.get("pick_code") or "")
-                if node_id and pickcode and sha1==str(entry["sha1"]).upper() and size==int(entry["size"]):
-                    return {"node_id":node_id,"name":str(item.get("n") or item.get("fn") or item.get("file_name") or entry["name"]),
-                            "is_dir":False,"pickcode":pickcode,"sha1":sha1,"size":size}
+                found=P115._file_entry(item,entry)
+                if found: return found
         return None
+
+    @staticmethod
+    def find_file(cookie, entry):
+        from p115client import P115Client
+        client=P115Client(P115.cookie_mapping(cookie))
+        return P115._find_file_client(client,entry)
 
     @staticmethod
     def transfer(source_cookie, user_cookie, entry, target_cid):
@@ -836,25 +888,10 @@ class P115:
         if verified():
             return
 
-        title = re.split(r"\.(?:19|20)\d{2}\b|\.S\d{1,2}E\d{1,3}\b", entry["name"], maxsplit=1, flags=re.I)[0]
-        queries = list(dict.fromkeys(filter(None, (title.strip(" ._-"), Path(entry["name"]).stem))))
-        existing = None
-        for query in queries:
-            result = target.fs_search({"search_value": query, "limit": 115, "offset": 0, "show_dir": 0})
-            data = result.get("data") if isinstance(result, dict) else None
-            items = (data.get("data") or data.get("list") or []) if isinstance(data, dict) else data if isinstance(data, list) else []
-            for item in items:
-                sha1 = str(item.get("sha") or item.get("sha1") or "").upper()
-                size = int(item.get("s") or item.get("size") or 0)
-                file_id = str(item.get("fid") or item.get("file_id") or "")
-                if file_id and sha1 == entry["sha1"].upper() and size == int(entry["size"]):
-                    existing = file_id
-                    break
-            if existing:
-                break
+        existing=P115._find_file_client(target,entry)
         if existing:
             before = {item["node_id"] for item in target_entries()}
-            result = target.fs_copy(existing, pid=target_cid)
+            result = target.fs_copy(existing["node_id"], pid=target_cid)
             if not isinstance(result, dict) or result.get("state") is False:
                 raise RuntimeError((result or {}).get("error") or "115 账号内复制失败")
             copied = None
@@ -875,15 +912,20 @@ class P115:
                     return
             raise RuntimeError("115 账号内复制结果校验失败")
 
-        url = source.download_url(entry["pickcode"])
-
         class RangeReader:
-            def __init__(self, source_url, name, size):
-                self.url = str(source_url)
-                self.headers = dict(getattr(source_url, "headers", None) or {})
+            def __init__(self, source_client, pickcode, name, size):
+                self.source = source_client
+                self.pickcode = pickcode
+                self.url = ""
+                self.headers = {}
                 self.name = name
                 self.size = int(size)
                 self.position = 0
+
+            def refresh(self):
+                source_url=self.source.download_url(self.pickcode,timeout=8)
+                self.url=str(source_url)
+                self.headers=dict(getattr(source_url,"headers",None) or {})
 
             def seek(self, offset, whence=0):
                 if whence == 0:
@@ -904,14 +946,25 @@ class P115:
                     return b""
                 start = self.position
                 end = min(self.size - 1, start + int(length) - 1)
-                headers = {**self.headers, "Range": f"bytes={start}-{end}", "Accept-Encoding": "identity"}
-                request = urllib.request.Request(self.url, headers=headers)
-                with urllib.request.urlopen(request, timeout=30) as response:
-                    data = response.read(end - start + 1)
+                last_error=None
+                for attempt in range(3):
+                    try:
+                        if not self.url or attempt: self.refresh()
+                        headers = {**self.headers, "Range": f"bytes={start}-{end}", "Accept-Encoding": "identity"}
+                        request = urllib.request.Request(self.url, headers=headers)
+                        with urllib.request.urlopen(request, timeout=8) as response:
+                            data = response.read(end - start + 1)
+                        if len(data) != end-start+1: raise IOError(f"115 验证片段长度异常：期望 {end-start+1}，实际 {len(data)}")
+                        break
+                    except Exception as exc:
+                        last_error=exc; self.url=""
+                        if attempt<2: time.sleep(0.5*(attempt+1))
+                else:
+                    raise RuntimeError(f"115 验证片段连续读取失败：{last_error}") from last_error
                 self.position += len(data)
                 return data
 
-        reader = RangeReader(url, entry["name"], entry["size"])
+        reader = RangeReader(source,entry["pickcode"], entry["name"], entry["size"])
         result = target.upload_file(reader, pid=target_cid, filesha1=entry["sha1"], filesize=entry["size"], filename=entry["name"])
         if isinstance(result, dict) and result.get("state") is False:
             raise RuntimeError(result.get("error") or "115 传输失败")
@@ -1022,6 +1075,7 @@ class Application:
         self.delivery_lock = threading.Lock()
         self.cleanup_lock = threading.Lock()
         self.loop_errors = {}
+        self.relay_failures = {}
         self.p115_gate = RateGate()
         self.cd2_gate = RateGate()
         self.transfer_gate = RateGate()
@@ -1036,7 +1090,8 @@ class Application:
         return metadata
 
     def notify_delivery_success(self,cfg,item):
-        fallback=f"✅ <b>派送完成</b>\n{html.escape(str(item['name']))}"
+        parsed=TMDB.parse_name(item.get("name",""),item.get("category","")); episode_text=TMDB.episode_text(parsed)
+        fallback=f"🥳 <b>派送成功</b>\n🎬 {html.escape(str(item['name']))}"+(f"\n📺 {episode_text}" if episode_text else "")
         api_key=str(cfg.get("tmdb_api_key") or "")
         if not cfg.get("tmdb_enabled") or not api_key:
             return self.telegram.send(item["tg_id"],fallback,False)
@@ -1092,8 +1147,11 @@ class Application:
         target_label=self.user_label(item)
         relay_errors=[]
         if cfg.get("distributed_transfer_enabled"):
-            for relay in self.store.relay_candidates(item["resource_id"],item["tg_id"]):
+            for relay in self.store.relay_candidates(item["resource_id"],item["tg_id"],item.get("sha1"),item.get("size")):
                 relay_label=self.user_label(relay)
+                failure_key=(str(item.get("sha1") or item["resource_id"]).upper(),int(relay["tg_id"]))
+                if self.relay_failures.get(failure_key,0)>now():
+                    continue
                 try:
                     def relay_action(relay=relay):
                         relay_entry=P115.find_file(relay["cookie"],item)
@@ -1102,10 +1160,12 @@ class Application:
                         return P115.transfer(relay["cookie"],target_cookie,relay_entry,item["target_cid"])
                     self.timed_call(relay_action,remaining_timeout())
                     self.store.event("接力秒传",f"{relay_label} → {target_label}：{item['name']} 成功",item["id"])
+                    self.relay_failures.pop(failure_key,None)
                     return f"接力：{relay_label}"
                 except TimeoutError:
                     raise
                 except Exception as exc:
+                    self.relay_failures[failure_key]=now()+1800
                     error=self.transfer_error(exc); relay_errors.append(f"{relay_label}：{error}")
                     self.store.event("接力跳过",f"{relay_label} → {target_label}：{item['name']}；{error}",item["id"])
         source_cookie=self.store.source_cookie(item["source_id"],cfg["source_cookie"])
