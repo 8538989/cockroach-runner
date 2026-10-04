@@ -111,6 +111,8 @@ class Store:
                 ("resources","hidden","INTEGER NOT NULL DEFAULT 0"),
                 ("users","membership_expires","INTEGER NOT NULL DEFAULT 0"),
                 ("users","membership_plan","TEXT NOT NULL DEFAULT ''"),
+                ("users","account_ready","INTEGER NOT NULL DEFAULT 0"),
+                ("users","tmdb_subscriptions","TEXT NOT NULL DEFAULT '[]'"),
                 ("bindings","plan","TEXT NOT NULL DEFAULT 'month'"),
                 ("bindings","grant_days","INTEGER NOT NULL DEFAULT 30"),
             ):
@@ -119,6 +121,8 @@ class Store:
         self.ensure_legacy_source()
         with self.lock, self.db:
             stamp = now()
+            self.db.execute("""UPDATE users SET account_ready=1 WHERE account_ready=0 AND cookie<>'' AND uid<>''
+              AND target_cid NOT IN ('','0') AND target_name NOT IN ('','根目录')""")
             self.db.execute("""UPDATE deliveries SET status='retry',next_attempt=0,updated=?,
               error=CASE WHEN error='' THEN '服务重启后自动恢复未完成任务' ELSE error END WHERE status='running'""", (stamp,))
             self.db.execute("""UPDATE resources SET cleanup='retained'
@@ -228,7 +232,8 @@ class Store:
         with self.lock: row = self.db.execute("SELECT * FROM users WHERE tg_id=?", (tg_id,)).fetchone()
         if not row: return None
         value = dict(row); value["categories"] = json.loads(value["categories"] or "[]")
-        value["enabled"] = bool(value["enabled"]); value["hierarchy"] = bool(value["hierarchy"])
+        value["tmdb_subscriptions"] = json.loads(value.get("tmdb_subscriptions") or "[]")
+        value["enabled"] = bool(value["enabled"]); value["hierarchy"] = bool(value["hierarchy"]); value["account_ready"] = bool(value.get("account_ready"))
         if include_cookie:
             try: value["cookie"] = self.crypt.decrypt(value["cookie"].encode()).decode() if value["cookie"] else ""
             except InvalidToken: value["cookie"] = ""
@@ -248,12 +253,13 @@ class Store:
     def save_user(self, tg_id, value):
         current = self.user(tg_id, True)
         if not current: raise ValueError("用户不存在")
-        fields = {k: value[k] for k in ("target_cid","target_name","enabled","include_terms","exclude_terms","hierarchy","status","note","search_limit") if k in value}
+        fields = {k: value[k] for k in ("target_cid","target_name","enabled","include_terms","exclude_terms","hierarchy","status","note","search_limit","account_ready") if k in value}
         if "mode" in value:
             mode=str(value.get("mode") or "all")
-            if mode not in {"all","subscription","category","both","either","off"}: raise ValueError("接收模式无效")
+            if mode not in {"all","subscription","category","both","either","tmdb","off"}: raise ValueError("接收模式无效")
             fields["mode"]=mode
         if "categories" in value: fields["categories"] = dumps(value["categories"] if isinstance(value["categories"], list) else [])
+        if "tmdb_subscriptions" in value: fields["tmdb_subscriptions"] = dumps(value["tmdb_subscriptions"] if isinstance(value["tmdb_subscriptions"], list) else [])
         if value.get("cookie"):
             fields["cookie"] = self.crypt.encrypt(str(value["cookie"]).strip().encode()).decode()
             fields["uid"] = str(value.get("uid") or "")
@@ -609,6 +615,24 @@ class TMDB:
         data = TMDB.request(api_key, f"{media_type}/{int(tmdb_id)}", {"append_to_response": "credits,external_ids"})
         data["media_type"] = media_type
         return data
+
+    @staticmethod
+    def search(api_key, query):
+        text=str(query or "").strip()[:100]
+        if not text: return []
+        result=TMDB.request(api_key,"search/multi",{"query":text,"include_adult":"false"})
+        items=[]
+        for item in result.get("results") or []:
+            media_type=str(item.get("media_type") or "")
+            if media_type not in {"movie","tv"} or not item.get("id"): continue
+            title=str(item.get("title") or item.get("name") or item.get("original_title") or item.get("original_name") or "")
+            date=str(item.get("release_date") or item.get("first_air_date") or "")
+            poster=str(item.get("poster_path") or "")
+            items.append({"id":int(item["id"]),"media_type":media_type,"title":title,"year":date[:4] if re.match(r"\d{4}",date) else "",
+                          "poster":TMDB.IMAGE+poster if poster.startswith("/") else "","overview":str(item.get("overview") or "")[:240],
+                          "rating":round(float(item.get("vote_average") or 0),1)})
+            if len(items)>=12: break
+        return items
 
     @staticmethod
     def lookup(api_key, item):
@@ -1137,7 +1161,9 @@ class Application:
         status,cookie=P115.qr_poll(session["token"],session["app"])
         if status != "confirmed": return {"status":status,"expires":session["expires"]}
         profile=P115.profile(cookie)
-        user=self.store.save_user(tg_id,{"cookie":cookie,"uid":profile["uid"],"target_cid":str(value.get("target_cid") or "0"),"target_name":str(value.get("target_name") or "根目录")})
+        target_cid=str(value.get("target_cid") or "0"); target_name=str(value.get("target_name") or "根目录")
+        ready=bool(target_cid not in {"","0"} and target_name not in {"","根目录"})
+        user=self.store.save_user(tg_id,{"cookie":cookie,"uid":profile["uid"],"target_cid":target_cid,"target_name":target_name,"account_ready":ready})
         with self.qr_lock: self.qr_sessions.pop(sid,None)
         self.store.event("用户管理",f"扫码绑定115：{tg_id}",str(tg_id))
         return {"status":"confirmed","user":user,"account":profile}
@@ -1177,6 +1203,56 @@ class Application:
         user = self.store.user(tg_id, True)
         if not user: raise ValueError("用户不存在")
         return {"provider": "115", "items": self.folders_115(user.get("cookie", ""), query.get("cid", ["0"])[0])}
+
+    def mini_account_validate(self,tg_id,value):
+        cookie=str(value.get("cookie") or "").strip()
+        if not cookie: raise ValueError("请先填写 115 CK")
+        profile=P115.profile(cookie)
+        user=self.store.save_user(tg_id,{"cookie":cookie,"uid":profile["uid"],"account_ready":False})
+        return {"user":user,"account":profile,"message":"CK 已验证，请继续选择接收文件夹并完成保存"}
+
+    def mini_account_save(self,tg_id,value):
+        current=self.store.user(tg_id,True)
+        if not current: raise ValueError("用户不存在")
+        cookie=str(value.get("cookie") or current.get("cookie") or "").strip()
+        if not cookie: raise ValueError("请先填写并验证 115 CK")
+        target_cid=str(value.get("target_cid") or "").strip()
+        target_name=str(value.get("target_name") or "").strip()
+        if not target_cid or target_cid == "0" or not target_name or target_name == "根目录":
+            raise ValueError("请先从 115 网盘选择一个非根目录作为接收文件夹")
+        profile=P115.profile(cookie) if value.get("cookie") else {"uid":current.get("uid"),"name":""}
+        self.folders_115(cookie,target_cid)
+        user=self.store.save_user(tg_id,{"cookie":cookie,"uid":profile["uid"],"target_cid":target_cid,"target_name":target_name,"account_ready":True})
+        return {"user":user,"account":profile,"message":"115 CK 与接收文件夹已保存"}
+
+    def mini_tmdb_search(self,query):
+        api_key=str(self.store.get("tmdb_api_key","") or "")
+        if not self.store.get("tmdb_enabled",False) or not api_key: raise RuntimeError("管理员尚未启用 TMDB 搜索")
+        return TMDB.search(api_key,str(query or ""))
+
+    def mini_tmdb_subscription(self,tg_id,value):
+        user=self.store.user(tg_id)
+        if not user: raise ValueError("用户不存在")
+        action=str(value.get("action") or "add"); media_type=str(value.get("media_type") or ""); tmdb_id=int(value.get("id") or 0)
+        if action not in {"add","remove"} or media_type not in {"movie","tv"} or tmdb_id<=0: raise ValueError("TMDB 订阅参数无效")
+        subscriptions=list(user.get("tmdb_subscriptions") or [])
+        subscriptions=[item for item in subscriptions if not (int(item.get("id") or 0)==tmdb_id and item.get("media_type")==media_type)]
+        update={"tmdb_subscriptions":subscriptions}
+        if action == "add":
+            if len(subscriptions)>=100: raise ValueError("每个用户最多订阅 100 个 TMDB 条目")
+            api_key=str(self.store.get("tmdb_api_key","") or "")
+            if not self.store.get("tmdb_enabled",False) or not api_key: raise RuntimeError("管理员尚未启用 TMDB 搜索")
+            detail=TMDB.detail(api_key,media_type,tmdb_id)
+            title=str(detail.get("title") or detail.get("name") or "")
+            date=str(detail.get("release_date") or detail.get("first_air_date") or "")
+            poster=str(detail.get("poster_path") or "")
+            subscriptions.append({"id":tmdb_id,"media_type":media_type,"title":title,"year":date[:4] if re.match(r"\d{4}",date) else "",
+                                  "poster":TMDB.IMAGE+poster if poster.startswith("/") else ""})
+            update={"tmdb_subscriptions":subscriptions,"mode":"tmdb","enabled":True}
+        elif not subscriptions and user.get("mode")=="tmdb": update.update({"mode":"off","enabled":False})
+        saved=self.store.save_user(tg_id,update)
+        self.store.event("TMDB订阅",f"{saved.get('name') or saved.get('username') or tg_id}：{'添加' if action=='add' else '取消'} {tmdb_id}",str(tg_id))
+        return {"user":saved}
 
     def scan(self, force=True, process_tasks=True):
         if not self.scan_lock.acquire(False): return
@@ -1304,7 +1380,7 @@ class Application:
         return ""
 
     def queue_resource(self,rid,name,category,stamp):
-        users=self.store.db.execute("SELECT * FROM users WHERE enabled=1 AND status='active' AND cookie<>'' AND membership_expires>?",(stamp,)).fetchall()
+        users=self.store.db.execute("SELECT * FROM users WHERE enabled=1 AND account_ready=1 AND target_cid NOT IN ('','0') AND status='active' AND cookie<>'' AND membership_expires>?",(stamp,)).fetchall()
         for user in users:
             if self.matches(dict(user),name,category):
                 did=hashlib.sha256(f"{rid}:{user['tg_id']}".encode()).hexdigest()
@@ -1317,6 +1393,11 @@ class Application:
         excluded = [x.strip().lower() for x in re.split(r"[,，;；\n]+",str(user.get("exclude_terms") or "")) if x.strip()]
         if any(x in lower for x in excluded): return False
         if mode == "all": return True
+        if mode == "tmdb":
+            parsed=TMDB.parse_name(name,category); tmdb_id=parsed["tmdb_id"]
+            if not tmdb_id: return False
+            subscriptions=json.loads(user.get("tmdb_subscriptions") or "[]")
+            return any(int(item.get("id") or 0)==tmdb_id and item.get("media_type")==parsed["media_type"] for item in subscriptions)
         categories = json.loads(user.get("categories") or "[]")
         cat_ok = category in categories
         terms = [x.strip().lower() for x in re.split(r"[,，;；\n]+",str(user.get("include_terms") or "")) if x.strip()]
@@ -1337,7 +1418,7 @@ class Application:
         with self.store.lock:
             rows = self.store.db.execute("""SELECT d.id,d.resource_id,d.tg_id,d.attempts,r.*,u.cookie,u.target_cid,u.name user_name,u.username,u.note
               FROM deliveries d JOIN resources r ON r.id=d.resource_id JOIN users u ON u.tg_id=d.tg_id
-              WHERE d.status IN ('waiting','retry') AND d.attempts<? AND d.next_attempt<=? AND u.status='active' AND u.enabled=1 AND u.membership_expires>?
+              WHERE d.status IN ('waiting','retry') AND d.attempts<? AND d.next_attempt<=? AND u.status='active' AND u.enabled=1 AND u.account_ready=1 AND u.target_cid NOT IN ('','0') AND u.membership_expires>?
               ORDER BY d.created LIMIT 20""",(max_attempts,stamp,stamp)).fetchall()
         workers=max(1,min(8,int(cfg.get("concurrency") or 1)))
         if workers==1:
@@ -1538,10 +1619,12 @@ class Handler(BaseHTTPRequestHandler):
             if path == "/api/mini/me" and method == "GET": uid=self.mini(); return self.send_json(200, {"user": self.app.store.user(uid), "categories": ["电影","剧集","动漫","纪录片","其他"], "qr_apps": QR_LOGIN_APPS})
             if path == "/api/mini/overview" and method == "GET": uid=self.mini(); return self.send_json(200, self.app.store.mini_overview(uid))
             if path == "/api/mini/browse" and method == "GET": uid=self.mini(); return self.send_json(200, self.app.mini_browse(uid,query))
+            if path == "/api/mini/tmdb/search" and method == "GET": self.mini(); return self.send_json(200,{"items":self.app.mini_tmdb_search(query.get("q",[""])[0])})
+            if path == "/api/mini/tmdb/subscriptions" and method == "POST": uid=self.mini(); return self.send_json(200,self.app.mini_tmdb_subscription(uid,self.body()))
             if path == "/api/mini/preferences" and method == "PUT": uid=self.mini(); return self.send_json(200, {"user": self.app.store.save_user(uid, self.body())})
+            if path == "/api/mini/account/validate" and method == "POST": uid=self.mini(); return self.send_json(200,self.app.mini_account_validate(uid,self.body()))
             if path == "/api/mini/account" and method == "PUT":
-                uid=self.mini(); value=self.body(); profile=P115.profile(str(value.get("cookie") or "")); value["uid"]=profile["uid"]
-                return self.send_json(200, {"user": self.app.store.save_user(uid, value), "account": profile})
+                uid=self.mini(); return self.send_json(200,self.app.mini_account_save(uid,self.body()))
             if path == "/api/mini/qr/start" and method == "POST": uid=self.mini(); return self.send_json(200,self.app.qr_start(uid,self.body()))
             if path == "/api/mini/qr/status" and method == "POST": uid=self.mini(); return self.send_json(200,self.app.qr_poll(uid,self.body()))
             return self.send_json(404, {"error": "接口不存在"})

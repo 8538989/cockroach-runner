@@ -16,11 +16,13 @@ const state = {
   qr: null,
   folder: null,
   accountDraft: null,
+  tmdbResults: [],
+  tmdbSearching: false,
 };
 let qrTimer = null;
 
 const pages = [["home", "首页"], ["rules", "接收"], ["records", "记录"], ["account", "我的"]];
-const modeLabels = { all: "全部接收", subscription: "按订阅关键词", category: "按分类", both: "订阅和分类", off: "关闭接收" };
+const modeLabels = { all: "全部接收", subscription: "按订阅关键词", category: "按分类", both: "订阅和分类", tmdb: "按 TMDB 订阅", off: "关闭接收" };
 const statusLabels = { waiting: "等待中", running: "派送中", retry: "重试中", delivered: "已完成", cancelled: "已取消", failed: "失败" };
 
 const esc = (value) => String(value ?? "").replace(/[&<>"']/g, (char) => ({
@@ -117,17 +119,22 @@ async function savePreferences() {
 
 async function bindAccount() {
   const cookie = document.querySelector("#cookie")?.value.trim();
-  if (!cookie) {
-    toast("请先填写 115 Cookie");
+  if (!cookie && !state.profile.account_bound) {
+    toast("请先填写或扫码获取 115 CK");
     return;
   }
   const target = accountValues();
+  if (!target.target_cid || target.target_cid === "0" || !target.target_name || target.target_name === "根目录") {
+    toast("请先从 115 网盘选择一个非根目录作为接收文件夹");
+    return;
+  }
   state.saving = true;
   render();
   try {
-    const data = await api("/api/mini/account", "PUT", { ...target, cookie });
+    const data = await api("/api/mini/account", "PUT", { ...target, ...(cookie ? {cookie} : {}) });
     state.profile = data.user;
-    toast(`CK 已验证并保存：${data.account?.name || data.account?.uid || "115账号"}`);
+    state.accountDraft = null;
+    toast(data.message || `账号与接收文件夹已保存：${data.account?.name || data.account?.uid || "115账号"}`);
   } catch (error) {
     toast(error.message);
   } finally {
@@ -162,9 +169,9 @@ async function openMiniFolderPicker() {
   if (cookie) {
     state.saving = true;
     try {
-      const data = await api("/api/mini/account", "PUT", {...state.accountDraft, cookie});
+      const data = await api("/api/mini/account/validate", "POST", {cookie});
       state.profile = data.user;
-      toast("CK 已验证并安全保存，正在读取网盘目录");
+      toast(data.message || "CK 已验证，正在读取网盘目录");
     } catch (error) {
       toast(error.message);
       state.saving = false;
@@ -222,7 +229,7 @@ async function pollQrLogin() {
       state.profile = data.user;
       state.qr = null;
       render();
-      toast(`扫码绑定成功：${data.account?.name || data.account?.uid || "115账号"}`);
+      toast(data.user?.account_ready ? `扫码绑定成功：${data.account?.name || data.account?.uid || "115账号"}` : "扫码成功，请继续选择接收文件夹并保存");
       return;
     }
     state.qr.status = data.status;
@@ -233,6 +240,48 @@ async function pollQrLogin() {
     state.qr.error = error.message;
     render();
   }
+}
+
+async function searchTmdb() {
+  const query = document.querySelector("#tmdbQuery")?.value.trim() || "";
+  if (!query) return toast("请输入影片或剧集名称");
+  state.tmdbSearching = true;
+  render();
+  try {
+    const data = await api(`/api/mini/tmdb/search?q=${encodeURIComponent(query)}`);
+    state.tmdbResults = data.items || [];
+    if (!state.tmdbResults.length) toast("没有找到匹配的 TMDB 条目");
+  } catch (error) {
+    toast(error.message);
+  } finally {
+    state.tmdbSearching = false;
+    render();
+  }
+}
+
+async function updateTmdbSubscription(action, mediaType, id) {
+  state.saving = true;
+  render();
+  try {
+    const data = await api("/api/mini/tmdb/subscriptions", "POST", {action, media_type: mediaType, id: Number(id)});
+    state.profile = data.user;
+    toast(action === "add" ? "已订阅，接收模式已切换为按 TMDB 订阅" : "已取消订阅");
+  } catch (error) {
+    toast(error.message);
+  } finally {
+    state.saving = false;
+    render();
+  }
+}
+
+function tmdbCard(item, subscribed = false) {
+  const kind = item.media_type === "tv" ? "剧集" : "电影";
+  return `<article class="tmdb-card">
+    ${item.poster ? `<img src="${esc(item.poster)}" alt="${esc(item.title)} 海报" loading="lazy">` : '<div class="tmdb-poster-empty">🎬</div>'}
+    <div><strong>${esc(item.title || `TMDB ${item.id}`)}</strong><small>${esc([item.year, kind, item.rating ? `${item.rating} 分` : ""].filter(Boolean).join(" · "))}</small>
+    ${item.overview ? `<p>${esc(item.overview)}</p>` : ""}</div>
+    <button class="${subscribed ? "secondary" : "primary"}" data-tmdb-action="${subscribed ? "remove" : "add"}" data-tmdb-type="${esc(item.media_type)}" data-tmdb-id="${Number(item.id)}" ${state.saving ? "disabled" : ""}>${subscribed ? "取消" : "订阅"}</button>
+  </article>`;
 }
 
 function shell(content) {
@@ -254,6 +303,7 @@ function home() {
   const member = membership(user.membership_expires);
   const stats = state.overview.stats || {};
   const recent = state.overview.deliveries.slice(0, 3);
+  const subscriptions = user.tmdb_subscriptions || [];
   return shell(`<section class="panel hero-panel">
     <span class="badge ${member.active ? "green" : "red"}">${esc(member.text)}</span>
     <h1>晚上好，${esc(user.name || user.username || "朋友")}</h1>
@@ -264,11 +314,18 @@ function home() {
     <span>${esc(time(user.membership_expires))}</span>
     ${member.active ? "" : "<p>会员到期后自动派送已暂停，请使用新的绑定码续费。</p>"}
   </section>
+  <section class="panel tmdb-subscriptions">
+    <div class="section-head"><h2>TMDB 影视订阅</h2><span class="badge ${user.mode === "tmdb" && user.enabled ? "green" : "gray"}">${user.mode === "tmdb" && user.enabled ? "订阅模式已启用" : `${subscriptions.length} 项订阅`}</span></div>
+    <p class="muted">搜索电影或剧集并订阅。添加后会自动切换为“按 TMDB 订阅”，只有文件名中对应的 TMDB ID 才会派送。</p>
+    <div class="tmdb-search"><input id="tmdbQuery" placeholder="搜索片名，例如：蝙蝠侠"><button class="primary" data-tmdb-search ${state.tmdbSearching ? "disabled" : ""}>${state.tmdbSearching ? "搜索中..." : "搜索"}</button></div>
+    ${subscriptions.length ? `<div class="tmdb-list"><h3>我的订阅</h3>${subscriptions.map(item => tmdbCard(item, true)).join("")}</div>` : '<p class="tmdb-empty">还没有 TMDB 订阅。</p>'}
+    ${state.tmdbResults.length ? `<div class="tmdb-list"><h3>搜索结果</h3>${state.tmdbResults.map(item => tmdbCard(item, subscriptions.some(sub => Number(sub.id) === Number(item.id) && sub.media_type === item.media_type))).join("")}</div>` : ""}
+  </section>
   <section class="stat-grid">
     <div class="stat"><span>已完成派送</span><strong>${stats.delivered || 0}</strong></div>
     <div class="stat"><span>处理中</span><strong>${stats.pending || 0}</strong></div>
     <div class="stat"><span>失败/取消</span><strong>${stats.failed || 0}</strong></div>
-    <div class="stat"><span>115 账号</span><strong>${user.account_bound ? "已绑定" : "未绑定"}</strong></div>
+    <div class="stat"><span>115 账号</span><strong>${user.account_ready ? "配置完整" : user.account_bound ? "待选目录" : "未绑定"}</strong></div>
   </section>
   <section class="panel">
     <div class="section-head"><h2>快捷操作</h2></div>
@@ -336,24 +393,24 @@ function account() {
       <div class="avatar">${esc(String(user.name || user.username || "蟑").slice(0, 1))}</div>
       <div>
         <h2>${esc(user.name || user.username || user.tg_id)}</h2>
-        <p class="muted">${user.account_bound ? `115 UID ${esc(user.uid)}` : "115 尚未绑定"}</p>
+        <p class="muted">${user.account_ready ? `115 UID ${esc(user.uid)} · 配置完整` : user.account_bound ? `115 UID ${esc(user.uid)} · 待选择接收文件夹` : "115 尚未绑定"}</p>
       </div>
     </div>
   </section>
   <section class="panel">
-    <div class="section-head"><h2>115 账号</h2><span class="badge ${user.account_bound ? "green" : "gray"}">${user.account_bound ? "已加密保存" : "未填写"}</span></div>
+    <div class="section-head"><h2>115 账号</h2><span class="badge ${user.account_ready ? "green" : user.account_bound ? "blue" : "gray"}">${user.account_ready ? "配置完整" : user.account_bound ? "待选文件夹" : "未填写"}</span></div>
     <p class="muted">Cookie 只保存在服务器端，用于把匹配到的资源派送到你的 115 目录。</p>
     <label class="field"><span>115 Cookie</span><textarea id="cookie" rows="4" placeholder="UID=...; CID=...; SEID=...; KID=..."></textarea></label>
-    <label class="field"><span>目标目录 CID</span><input id="cid" value="${esc(target.target_cid)}"></label>
-    <label class="field"><span>目标目录名称</span><input id="target" value="${esc(target.target_name)}"></label>
-    <p class="folder-tip">首次选择接收文件夹前，请先填写 115 CK。点击“从 115 网盘选择”时，系统会先验证并安全保存 CK，再为你打开网盘目录。</p>
+    <label class="field"><span>目标目录 CID</span><input id="cid" value="${esc(target.target_cid)}" readonly></label>
+    <label class="field"><span>目标目录名称</span><input id="target" value="${esc(target.target_name)}" readonly></label>
+    <p class="folder-tip">请先填写或扫码获取 115 CK，再从网盘选择一个非根目录。CK 和接收文件夹缺少任意一项都不能完成保存，也不会创建派送任务。</p>
     <button class="secondary full compact" data-folder-open>从 115 网盘选择接收文件夹</button>
     ${state.folder ? `<div class="mini-folder-picker">
       <div class="mini-folder-head"><button class="text-button" data-folder-back ${state.folder.stack.length <= 1 ? "disabled" : ""}>返回</button><strong>${esc(state.folder.stack.map(item => item.name).join(" / "))}</strong><button class="text-button" data-folder-close>关闭</button></div>
       ${state.folder.loading ? '<div class="folder-loading">正在读取...</div>' : state.folder.items.length ? state.folder.items.map((item, index) => `<button class="mini-folder-entry" data-folder-enter="${index}">📁 ${esc(item.name)}</button>`).join("") : '<div class="folder-loading">没有子文件夹</div>'}
       <button class="primary full" data-folder-select>选择当前文件夹</button>
     </div>` : ""}
-    <button class="secondary full compact" data-bind ${state.saving ? "disabled" : ""}>${state.saving ? "正在验证..." : "验证并保存 CK"}</button>
+    <button class="secondary full compact" data-bind ${state.saving ? "disabled" : ""}>${state.saving ? "正在保存..." : "保存账号与接收文件夹"}</button>
     <div class="account-divider"><span>或使用扫码获取 CK</span></div>
     <label class="field"><span>扫码登录端</span><select id="qrApp" ${state.qr && !["expired","error"].includes(state.qr.status) ? "disabled" : ""}>${Object.entries(state.qrApps).map(([value, label]) => `<option value="${esc(value)}" ${selectedQrApp === value ? "selected" : ""}>${esc(label)}</option>`).join("")}</select></label>
     <button class="primary full" data-qr-start ${state.saving ? "disabled" : ""}>${state.saving ? "正在生成..." : "扫码获取 CK"}</button>
@@ -388,6 +445,9 @@ function bind() {
   }));
   root.querySelector("[data-save]")?.addEventListener("click", savePreferences);
   root.querySelector("[data-bind]")?.addEventListener("click", bindAccount);
+  root.querySelector("[data-tmdb-search]")?.addEventListener("click", searchTmdb);
+  root.querySelector("#tmdbQuery")?.addEventListener("keydown", (event) => { if (event.key === "Enter") searchTmdb(); });
+  root.querySelectorAll("[data-tmdb-action]").forEach((node) => node.addEventListener("click", () => updateTmdbSubscription(node.dataset.tmdbAction, node.dataset.tmdbType, node.dataset.tmdbId)));
   root.querySelectorAll("[data-qr-start]").forEach((node) => node.addEventListener("click", startQrLogin));
   const qrImage = root.querySelector("[data-qr-image]");
   qrImage?.addEventListener("error", () => {

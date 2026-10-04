@@ -88,7 +88,7 @@ class ScanTests(unittest.TestCase):
             store.set("source_cookie", "source", True)
             store.set("enabled", True)
             store.upsert_user(123)
-            store.save_user(123, {"cookie": "target", "uid": "u1"})
+            store.save_user(123, {"cookie": "target", "uid": "u1", "target_cid": "99", "target_name": "影视", "account_ready": True})
             stamp = service.now()
             with store.db:
                 store.db.execute("INSERT INTO resources(id,node_id,name,pickcode,sha1,size,is_dir,category,first_seen,status,source_id) VALUES('r','1','Movie.2024.mkv','p','a',1,0,'电影',?,'waiting','legacy')", (stamp,))
@@ -340,7 +340,7 @@ class ScanTests(unittest.TestCase):
             store.set("enabled", True)
             store.set("p115_api_interval_seconds", 0)
             store.upsert_user(123)
-            store.save_user(123, {"cookie": "target", "uid": "u1"})
+            store.save_user(123, {"cookie": "target", "uid": "u1", "target_cid": "99", "target_name": "影视", "account_ready": True})
             with store.db:
                 store.db.execute("UPDATE sources SET baseline_ready=1,stable_seconds=0 WHERE id='legacy'")
             tree = {
@@ -395,7 +395,7 @@ class ScanTests(unittest.TestCase):
             store.set("enabled", True)
             store.set("p115_api_interval_seconds", 0)
             store.upsert_user(123)
-            store.save_user(123, {"cookie": "target", "uid": "u1"})
+            store.save_user(123, {"cookie": "target", "uid": "u1", "target_cid": "99", "target_name": "影视", "account_ready": True})
             app = service.Application(store)
             rounds = [
                 [{"node_id": "1", "name": "Old.mkv", "is_dir": False, "pickcode": "p1", "sha1": "a", "size": 1}],
@@ -437,7 +437,7 @@ class ScanTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as data_dir:
             store = service.Store(data_dir, Fernet.generate_key().decode())
             store.upsert_user(123)
-            store.save_user(123, {"cookie": "target", "uid": "u1"})
+            store.save_user(123, {"cookie": "target", "uid": "u1", "target_cid": "99", "target_name": "影视", "account_ready": True})
             stamp = service.now()
             with store.db:
                 store.db.execute("UPDATE users SET membership_expires=? WHERE tg_id=123", (stamp - 1,))
@@ -457,6 +457,51 @@ class ScanTests(unittest.TestCase):
         self.assertFalse(service.Application.matches({**base, "mode": "both"}, "沙丘.2026.mkv", "电影"))
         self.assertFalse(service.Application.matches({**base, "mode": "off"}, "三体.S01E01.mkv", "剧集"))
         self.assertFalse(service.Application.matches({**base, "mode": "all", "enabled": 0}, "任意.mkv", "电影"))
+        tmdb = {**base, "mode": "tmdb", "tmdb_subscriptions": '[{"id":155,"media_type":"movie"}]'}
+        self.assertTrue(service.Application.matches(tmdb, "蝙蝠侠.2008.{tmdb-155}.mkv", "电影"))
+        self.assertFalse(service.Application.matches(tmdb, "其他影片.2008.{tmdb-156}.mkv", "电影"))
+        self.assertFalse(service.Application.matches(tmdb, "没有编号的影片.mkv", "电影"))
+
+    def test_mini_account_is_not_ready_until_non_root_folder_is_saved(self):
+        with tempfile.TemporaryDirectory() as data_dir:
+            store = service.Store(data_dir, Fernet.generate_key().decode())
+            store.set("p115_api_interval_seconds", 0)
+            store.upsert_user(123)
+            app = service.Application(store)
+            original_profile, original_list = service.P115.profile, service.P115.list_dir
+            try:
+                service.P115.profile = staticmethod(lambda cookie: {"uid": "u1", "name": "Tester"} if cookie == "CK" else {})
+                service.P115.list_dir = staticmethod(lambda cookie, cid: [] if cookie == "CK" and cid == "99" else (_ for _ in ()).throw(RuntimeError("bad folder")))
+                staged = app.mini_account_validate(123, {"cookie": "CK"})
+                self.assertFalse(staged["user"]["account_ready"])
+                with self.assertRaisesRegex(ValueError, "非根目录"):
+                    app.mini_account_save(123, {"target_cid": "0", "target_name": "根目录"})
+                saved = app.mini_account_save(123, {"target_cid": "99", "target_name": "影视"})
+                self.assertTrue(saved["user"]["account_ready"])
+                self.assertEqual((saved["user"]["target_cid"], saved["user"]["target_name"]), ("99", "影视"))
+            finally:
+                service.P115.profile, service.P115.list_dir = original_profile, original_list
+                store.db.close()
+
+    def test_tmdb_subscription_switches_to_exact_tmdb_mode(self):
+        with tempfile.TemporaryDirectory() as data_dir:
+            store = service.Store(data_dir, Fernet.generate_key().decode())
+            store.upsert_user(123)
+            store.set("tmdb_enabled", True)
+            store.set("tmdb_api_key", "key", True)
+            app = service.Application(store)
+            original_detail = service.TMDB.detail
+            try:
+                service.TMDB.detail = staticmethod(lambda key, media_type, tmdb_id: {"id": tmdb_id, "media_type": media_type, "title": "蝙蝠侠", "release_date": "2008-07-16", "poster_path": "/poster.jpg"})
+                result = app.mini_tmdb_subscription(123, {"action": "add", "media_type": "movie", "id": 155})
+                user = result["user"]
+                self.assertEqual((user["mode"], user["enabled"]), ("tmdb", True))
+                self.assertEqual(user["tmdb_subscriptions"][0]["id"], 155)
+                removed = app.mini_tmdb_subscription(123, {"action": "remove", "media_type": "movie", "id": 155})["user"]
+                self.assertEqual((removed["mode"], removed["enabled"], removed["tmdb_subscriptions"]), ("off", False, []))
+            finally:
+                service.TMDB.detail = original_detail
+                store.db.close()
 
     def test_membership_renewal_extends_from_current_expiry(self):
         with tempfile.TemporaryDirectory() as data_dir:
@@ -490,7 +535,7 @@ class ScanTests(unittest.TestCase):
             store.set("p115_api_interval_seconds", 0)
             store.set("cd2_api_interval_seconds", 0)
             store.upsert_user(123)
-            store.save_user(123, {"cookie": "target", "uid": "u1"})
+            store.save_user(123, {"cookie": "target", "uid": "u1", "target_cid": "99", "target_name": "影视", "account_ready": True})
             stamp = service.now()
             with store.db:
                 store.db.execute("UPDATE sources SET retention_minutes=5 WHERE id='legacy'")
@@ -576,7 +621,7 @@ class ScanTests(unittest.TestCase):
             store.set("p115_api_interval_seconds", 0)
             store.set("cd2_api_interval_seconds", 0)
             store.upsert_user(123)
-            store.save_user(123, {"cookie": "target", "uid": "u1"})
+            store.save_user(123, {"cookie": "target", "uid": "u1", "target_cid": "99", "target_name": "影视", "account_ready": True})
             watched = Path(data_dir) / "watched"
             watched.mkdir()
             (watched / "New.mkv").touch()
