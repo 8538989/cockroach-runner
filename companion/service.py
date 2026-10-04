@@ -172,6 +172,7 @@ class Store:
             "cd2_root": self.get("cd2_root", "/cd2/miaochuang"),
             "cd2_api_root": self.get("cd2_api_root", "/"),
             "cd2_token_configured": bool(self.get("cd2_api_token", "")),
+            "cd2_metadata_enabled": self.get("cd2_metadata_enabled", False),
             "p115_api_interval_seconds": self.get("p115_api_interval_seconds", 1),
             "cd2_api_interval_seconds": self.get("cd2_api_interval_seconds", 1),
             "transfer_interval_seconds": self.get("transfer_interval_seconds", 3),
@@ -197,7 +198,7 @@ class Store:
                    "check_hours", "retry_minutes", "max_attempts", "search_limit", "log_days", "mini_enabled", "theme",
                    "cd2_mode", "cd2_host", "cd2_port", "cd2_root", "cd2_api_root"}
         allowed.update({"p115_api_interval_seconds", "cd2_api_interval_seconds", "transfer_interval_seconds"})
-        allowed.update({"transfer_timeout_seconds","distributed_transfer_enabled","tmdb_enabled"})
+        allowed.update({"transfer_timeout_seconds","distributed_transfer_enabled","tmdb_enabled","cd2_metadata_enabled"})
         for key in allowed:
             if key in value: self.set(key, value[key])
         if value.get("bot_token"): self.set("bot_token", str(value["bot_token"]).strip(), True)
@@ -1026,7 +1027,16 @@ class CD2:
                     name = CD2._api_name(item)
                     full_path = str(getattr(item, "fullPathName", "") or "") or (path.rstrip("/") + "/" + name)
                     is_dir = bool(getattr(item, "isDirectory", False))
-                    if name: result.append({"name": name, "path": full_path, "is_dir": is_dir})
+                    hashes = getattr(item, "fileHashes", None)
+                    try:
+                        sha1 = str(hashes.get(2, "") or "").upper() if hashes is not None else ""
+                    except (AttributeError, TypeError):
+                        sha1 = ""
+                    if name:
+                        result.append({"name": name, "path": full_path, "is_dir": is_dir,
+                                       "node_id": str(getattr(item, "id", "") or ""),
+                                       "sha1": sha1,
+                                       "size": int(getattr(item, "size", 0) or 0)})
             return result
         except Exception as exc:
             raise RuntimeError(f"读取 CD2 API 目录失败：{exc}") from exc
@@ -1372,6 +1382,56 @@ class Application:
         self.cd2_snapshots[source["id"]] = snapshot
         return entries, force or previous is None or snapshot != previous
 
+    @staticmethod
+    def cd2_api_path(cfg, source):
+        if source.get("monitor_type") == "cd2_api":
+            path = str(source.get("cd2_path") or cfg.get("cd2_api_root") or "/").strip()
+            return "/" + path.lstrip("/")
+        mount_root = str(cfg.get("cd2_root") or "/cd2/miaochuang").replace("\\", "/").rstrip("/")
+        selected = str(source.get("cd2_path") or mount_root).replace("\\", "/").rstrip("/")
+        if selected != mount_root and not selected.startswith(mount_root + "/"):
+            raise ValueError("监听目录不在 CD2 挂载根目录内，无法映射到 API 路径")
+        relative = selected[len(mount_root):].strip("/")
+        api_root = "/" + str(cfg.get("cd2_api_root") or "/").strip("/")
+        return api_root.rstrip("/") + (("/" + relative) if relative else "") or "/"
+
+    def cd2_metadata_entries(self, cfg, source, source_cookie, force=False):
+        """Use CD2's cached IDs/hashes instead of querying the source 115 directory API."""
+        from p115client import P115Client
+        api_path = self.cd2_api_path(cfg, source)
+        queue = [api_path]
+        videos = []
+        signatures = []
+        visited_dirs = 0
+        source_client = P115Client(P115.cookie_mapping(source_cookie))
+        while queue:
+            path = queue.pop(0)
+            visited_dirs += 1
+            if visited_dirs > 1000:
+                raise RuntimeError("CD2 目录数量超过 1000，已停止递归以避免过量请求")
+            self.cd2_gate.wait(cfg.get("cd2_api_interval_seconds", 1))
+            for item in CD2.list_api(cfg, path):
+                signature = ("d:" if item["is_dir"] else "f:") + item["path"]
+                signature += f":{item.get('node_id','')}:{item.get('size',0)}:{item.get('sha1','')}"
+                signatures.append(signature)
+                if item["is_dir"]:
+                    queue.append(item["path"])
+                    continue
+                if Path(item["name"]).suffix.lower() not in VIDEO_EXTENSIONS:
+                    continue
+                node_id = str(item.get("node_id") or "")
+                sha1 = str(item.get("sha1") or "").upper()
+                if not node_id or not sha1:
+                    raise RuntimeError(f"CD2 未返回文件 ID 或 SHA1：{item['path']}")
+                videos.append({"node_id": node_id, "name": item["name"], "is_dir": False,
+                               "pickcode": str(source_client.to_pickcode(node_id)),
+                               "sha1": sha1, "size": int(item.get("size") or 0)})
+        snapshot = hashlib.sha256(dumps(sorted(signatures)).encode()).hexdigest()
+        snapshot_key = source["id"] + ":metadata"
+        previous = self.cd2_snapshots.get(snapshot_key)
+        self.cd2_snapshots[snapshot_key] = snapshot
+        return videos, force or previous is None or snapshot != previous
+
     def expand_source_videos(self, cfg, entries, source_cookie):
         videos = []
         queue = list(entries)
@@ -1393,8 +1453,18 @@ class Application:
             if not source_cookie: raise RuntimeError("该监听目录尚未配置可用的 115 CK")
             monitor_type = source.get("monitor_type") or "api_poll"
             local_names = None
+            entries = None
+            cd2_metadata_used = False
             if monitor_type.startswith("cd2_"):
-                local, changed = self.cd2_entries(cfg, source, force)
+                if cfg.get("cd2_metadata_enabled") and cfg.get("cd2_api_token"):
+                    try:
+                        entries, changed = self.cd2_metadata_entries(cfg, source, source_cookie, force)
+                        cd2_metadata_used = True
+                    except Exception as exc:
+                        self.store.event("CD2旁路回退",f"{source['name']}：{exc}，改用 115 API",source["id"])
+                if entries is None:
+                    local, changed = self.cd2_entries(cfg, source, force)
+                    local_names = set(local)
                 if not changed:
                     stable_cutoff = stamp - int(source["stable_seconds"])
                     with self.store.lock:
@@ -1404,11 +1474,11 @@ class Application:
                         with self.store.lock,self.store.db:
                             self.store.db.execute("UPDATE sources SET last_scan=?,next_scan=?,error='',updated=? WHERE id=?",(stamp,stamp+interval,stamp,source["id"]))
                         return ""
-                local_names = set(local)
-            self.p115_gate.wait(cfg.get("p115_api_interval_seconds", 1))
-            entries=P115.list_dir(source_cookie,source["cid"])
-            if local_names is not None: entries = [entry for entry in entries if entry["name"] in local_names]
-            entries=self.expand_source_videos(cfg,entries,source_cookie)
+            if entries is None:
+                self.p115_gate.wait(cfg.get("p115_api_interval_seconds", 1))
+                entries=P115.list_dir(source_cookie,source["cid"])
+                if local_names is not None: entries = [entry for entry in entries if entry["name"] in local_names]
+                entries=self.expand_source_videos(cfg,entries,source_cookie)
             discovered=0
             with self.store.lock,self.store.db:
                 baseline=bool(source["baseline_ready"])
@@ -1433,7 +1503,8 @@ class Application:
                 interval=2 if monitor_type=="cd2_realtime" else int(source["poll_seconds"])
                 self.store.db.execute("""UPDATE sources SET baseline_ready=1,historical=historical+?,added=added+?,last_scan=?,next_scan=?,error='',updated=? WHERE id=?""",
                   (discovered if not baseline else 0,discovered if baseline else 0,stamp,stamp+interval,stamp,source["id"]))
-            self.store.event("来源",f"扫描 {source['name']}：发现 {discovered} 项",source["id"])
+            scan_mode = "（CD2 元数据旁路）" if cd2_metadata_used else ""
+            self.store.event("来源",f"扫描 {source['name']}：发现 {discovered} 项{scan_mode}",source["id"])
         except Exception as exc:
             with self.store.lock,self.store.db: self.store.db.execute("UPDATE sources SET error=?,last_scan=?,next_scan=?,updated=? WHERE id=?",(str(exc)[:500],stamp,stamp+int(source["poll_seconds"]),stamp,source["id"]))
             self.store.event("来源失败",f"扫描 {source['name']}：{exc}",source["id"])

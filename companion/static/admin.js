@@ -109,6 +109,7 @@ function renderSettings(config = {}) {
   $('transferInterval').value = config.transfer_interval_seconds ?? 3
   $('transferTimeout').value = config.transfer_timeout_seconds ?? 300
   $('distributedTransfer').checked = Boolean(config.distributed_transfer_enabled)
+  $('cd2MetadataEnabled').checked = Boolean(config.cd2_metadata_enabled)
   $('tmdbEnabled').checked = Boolean(config.tmdb_enabled)
   $('enabled').checked = Boolean(config.enabled)
   $('miniEnabled').checked = config.mini_enabled !== false
@@ -404,6 +405,7 @@ $('save').addEventListener('click', () => perform(async () => {
     transfer_interval_seconds: Number($('transferInterval').value || 0),
     transfer_timeout_seconds: Number($('transferTimeout').value || 300),
     distributed_transfer_enabled: $('distributedTransfer').checked,
+    cd2_metadata_enabled: $('cd2MetadataEnabled').checked,
     tmdb_enabled: $('tmdbEnabled').checked,
     enabled: $('enabled').checked,
     mini_enabled: $('miniEnabled').checked,

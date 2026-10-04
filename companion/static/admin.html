@@ -82,7 +82,7 @@
           <label class="field"><span>CD2 挂载根目录（容器内）</span><input id="cd2Root" placeholder="/cd2/miaochuang"></label>
           <label class="field"><span>CD2 API 主机 / IP</span><input id="cd2Host" placeholder="127.0.0.1"></label>
           <label class="field"><span>CD2 API 端口</span><input id="cd2Port" type="number" min="1" max="65535" value="19798"></label>
-          <label class="field"><span>CD2 API 根目录</span><input id="cd2ApiRoot" placeholder="/"></label>
+          <label class="field"><span>CD2 API 根目录</span><input id="cd2ApiRoot" placeholder="/miaochuang"><small>填写 CD2 内的网盘根路径，例如 /miaochuang；不是 115open。</small></label>
           <label class="field"><span>CD2 API Token</span><input id="cd2ApiToken" type="password" placeholder="留空表示不修改"></label>
           <label class="field"><span>派送并发数</span><input id="concurrency" type="number" min="1" max="10"></label>
           <label class="field"><span>CK 检查周期（小时）</span><input id="checkHours" type="number" min="1" max="168"></label>
@@ -96,7 +96,8 @@
           <label class="field"><span>秒传任务最小间隔（秒）</span><input id="transferInterval" type="number" min="0" max="3600" step="0.1"></label>
           <label class="field"><span>单个秒传总超时（秒）</span><input id="transferTimeout" type="number" min="30" max="3600" step="1"><small>默认 300 秒；超时后暂停该任务并按退避时间重试。</small></label>
         </div>
-        <div class="checks"><label class="check"><input id="enabled" type="checkbox"> 启用自动扫描与派送</label><label class="check"><input id="distributedTransfer" type="checkbox"> 启用成功账号接力秒传（实验）</label><label class="check"><input id="tmdbEnabled" type="checkbox"> 启用 TMDB 海报式成功推送</label><label class="check"><input id="miniEnabled" type="checkbox"> 启用 Telegram 小程序</label></div>
+        <div class="checks"><label class="check"><input id="enabled" type="checkbox"> 启用自动扫描与派送</label><label class="check"><input id="cd2MetadataEnabled" type="checkbox"> 启用 CD2 元数据旁路（减少 115 API / 405）</label><label class="check"><input id="distributedTransfer" type="checkbox"> 启用成功账号接力秒传（实验）</label><label class="check"><input id="tmdbEnabled" type="checkbox"> 启用 TMDB 海报式成功推送</label><label class="check"><input id="miniEnabled" type="checkbox"> 启用 Telegram 小程序</label></div>
+        <p class="setting-note">CD2 元数据旁路会从 CD2 API 读取文件 ID、SHA1 和大小，避免扫描时反复查询源 115 目录；CD2 不可用时自动回退 115 API。最终向用户账号派送仍使用 115 秒传。</p>
         <p class="setting-note">开启接力后，同一文件任一用户接收成功都会立即唤醒此前出错或暂停的任务；接力账号中的文件都已移动、删除或不可用时，自动回退源账号。候选查找、接力秒传和源账号兜底共用上方“单个秒传总超时”。</p>
         <div class="actions"><button id="save" class="primary">保存设置</button><button id="testBot">测试 Bot</button><button id="testTmdb">测试 TMDB</button><button id="testCd2">测试 CD2</button><button id="scan">立即扫描</button></div>
       </section>

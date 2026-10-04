@@ -786,6 +786,60 @@ class ScanTests(unittest.TestCase):
             self.assertEqual((source["monitor_type"], source["cd2_path"]), ("cd2_api", "/cloud/watch"))
             store.db.close()
 
+    def test_cd2_mount_path_maps_to_configured_api_drive(self):
+        cfg = {"cd2_root": "/cd2/miaochuang", "cd2_api_root": "/miaochuang"}
+        source = {"monitor_type": "cd2_poll", "cd2_path": "/cd2/miaochuang/剧迷Gimy/派送目录"}
+        self.assertEqual(service.Application.cd2_api_path(cfg, source), "/miaochuang/剧迷Gimy/派送目录")
+        source["cd2_path"] = "/other/watch"
+        with self.assertRaisesRegex(ValueError, "不在"):
+            service.Application.cd2_api_path(cfg, source)
+
+    def test_cd2_metadata_bypass_avoids_source_directory_api(self):
+        with tempfile.TemporaryDirectory() as data_dir:
+            store = service.Store(data_dir, Fernet.generate_key().decode())
+            store.set("source_cookie", "SOURCE-CK", True)
+            store.save_config({"cd2_metadata_enabled": True, "cd2_api_token": "CD2-TOKEN"})
+            with store.db:
+                store.db.execute("UPDATE sources SET baseline_ready=1,monitor_type='cd2_poll',cd2_path='/cd2/miaochuang/watch',stable_seconds=0 WHERE id='legacy'")
+            app = service.Application(store)
+            entry = {"node_id": "123", "name": "CD2.Movie.mkv", "is_dir": False,
+                     "pickcode": "local-pickcode", "sha1": "ABC", "size": 100}
+            app.cd2_metadata_entries = lambda *_args, **_kwargs: ([entry], True)
+            original_list = service.P115.list_dir
+            try:
+                service.P115.list_dir = staticmethod(lambda *_args: (_ for _ in ()).throw(AssertionError("不应查询源115目录")))
+                error = app.scan_source(store.config(True), store.sources()[0], service.now(), False)
+                self.assertEqual(error, "")
+                row = store.db.execute("SELECT node_id,pickcode,sha1,size FROM resources WHERE name='CD2.Movie.mkv'").fetchone()
+                self.assertEqual(tuple(row), ("123", "local-pickcode", "ABC", 100))
+                event = store.db.execute("SELECT message FROM events WHERE kind='来源' ORDER BY id DESC LIMIT 1").fetchone()
+                self.assertIn("CD2 元数据旁路", event["message"])
+            finally:
+                service.P115.list_dir = original_list
+                store.db.close()
+
+    def test_cd2_metadata_failure_falls_back_to_115_api(self):
+        with tempfile.TemporaryDirectory() as data_dir:
+            store = service.Store(data_dir, Fernet.generate_key().decode())
+            store.set("source_cookie", "SOURCE-CK", True)
+            store.save_config({"cd2_metadata_enabled": True, "cd2_api_token": "CD2-TOKEN", "p115_api_interval_seconds": 0})
+            with store.db:
+                store.db.execute("UPDATE sources SET baseline_ready=1,monitor_type='cd2_poll',cd2_path='/watch',stable_seconds=0 WHERE id='legacy'")
+            app = service.Application(store)
+            app.cd2_metadata_entries = lambda *_args, **_kwargs: (_ for _ in ()).throw(RuntimeError("CD2 offline"))
+            app.cd2_entries = lambda *_args, **_kwargs: (["Fallback.mkv"], True)
+            entry = {"node_id": "9", "name": "Fallback.mkv", "is_dir": False, "pickcode": "p", "sha1": "A", "size": 1}
+            original_list = service.P115.list_dir
+            try:
+                service.P115.list_dir = staticmethod(lambda *_args: [entry])
+                self.assertEqual(app.scan_source(store.config(True), store.sources()[0], service.now(), False), "")
+                self.assertIsNotNone(store.db.execute("SELECT 1 FROM resources WHERE name='Fallback.mkv'").fetchone())
+                event = store.db.execute("SELECT message FROM events WHERE kind='CD2旁路回退'").fetchone()
+                self.assertIn("CD2 offline", event["message"])
+            finally:
+                service.P115.list_dir = original_list
+                store.db.close()
+
 
 if __name__ == "__main__":
     unittest.main()
