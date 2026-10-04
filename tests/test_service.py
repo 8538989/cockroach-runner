@@ -44,7 +44,9 @@ class ScanTests(unittest.TestCase):
                     "credits": {"cast": [{"id": 3894, "name": "克里斯蒂安·贝尔"}]},
                     "external_ids": {"imdb_id": "tt0468569"}}
         caption = service.TMDB.caption(item, metadata)
+        self.assertTrue(caption.startswith("🥳 <b>派送成功</b>\n"))
         self.assertIn("🎬 <b>蝙蝠侠：黑暗骑士 · 2008</b>", caption)
+        self.assertIn("接收方式 蟑影派送", caption)
         self.assertIn("欧美电影", caption)
         self.assertIn("TMDB ID", caption)
         self.assertIn("4K / HDR10 / HEVC / MKV", caption)

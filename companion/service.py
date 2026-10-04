@@ -680,9 +680,9 @@ class TMDB:
         imdb=(metadata.get("external_ids") or {}).get("imdb_id") or metadata.get("imdb_id") or ""
         parsed=TMDB.parse_name(item.get("name", ""),item.get("category", ""))
         episode_line=f" · S{parsed['season']:02d}E{parsed['episode']:02d}" if parsed["season"] else ""
-        lines=[f"🎬 <b>{html.escape(title)}{(' · '+year) if year else ''}{episode_line}</b>","", "🎞 <b>影片资料</b>",
+        lines=["🥳 <b>派送成功</b>",f"🎬 <b>{html.escape(title)}{(' · '+year) if year else ''}{episode_line}</b>","", "🎞 <b>影片资料</b>",
                f"├ 类型 {kind}",f'├ TMDB ID <a href="{tmdb_url}">{tmdb_id}</a>',f"├ 分类 {html.escape(category)}",
-               f"├ 评分 {rating:.1f} / 10",f"├ 主演 {actors}","├ 接收方式 115 秒传",f"└ 大小 {TMDB.size_text(item.get('size',0))}","",
+               f"├ 评分 {rating:.1f} / 10",f"├ 主演 {actors}","├ 接收方式 蟑影派送",f"└ 大小 {TMDB.size_text(item.get('size',0))}","",
                "🎥 <b>影音规格</b>",html.escape(spec_text),"", "📂 <b>文件列表 · 1 项</b>",f"1. <code>{html.escape(short_name)}</code>","",f"🏷 {html.escape(tag_line)}"]
         if imdb: lines.extend(["",f'🎬 <a href="https://www.imdb.com/title/{urllib.parse.quote(str(imdb))}/">IMDb {html.escape(str(imdb))}</a>'])
         overview=re.sub(r"\s+"," ",str(metadata.get("overview") or "")).strip()
