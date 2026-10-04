@@ -10,6 +10,30 @@ import service  # noqa: E402
 
 
 class ScanTests(unittest.TestCase):
+    def test_monitor_loop_is_decoupled_from_delivery_and_recovers_after_exception(self):
+        with tempfile.TemporaryDirectory() as data_dir:
+            store = service.Store(data_dir, Fernet.generate_key().decode())
+            store.set("enabled", True)
+            app = service.Application(store)
+            calls = []
+            class FastStop:
+                stopped = False
+                def is_set(self): return self.stopped
+                def wait(self, _seconds): return self.stopped
+                def set(self): self.stopped = True
+            app.stop = FastStop()
+            def scan(force, process_tasks):
+                calls.append((force, process_tasks))
+                if len(calls) == 1: raise RuntimeError("temporary monitor error")
+                app.stop.set()
+            app.scan = scan
+            app.scheduler()
+            self.assertEqual(calls, [(False, False), (False, False)])
+            self.assertGreater(store.get("monitor_heartbeat", 0), 0)
+            event = store.db.execute("SELECT message FROM events WHERE kind='后台自恢复'").fetchone()
+            self.assertIn("temporary monitor error", event["message"])
+            store.db.close()
+
     def test_tmdb_filename_parser_and_rich_caption(self):
         item = {"name": "蝙蝠侠：黑暗骑士 (2008) - 2160p.HDR10.HEVC.mkv", "size": 68490000000, "category": "电影"}
         parsed = service.TMDB.parse_name(item["name"], item["category"])

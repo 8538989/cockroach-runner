@@ -83,10 +83,12 @@ function renderStats(data) {
   $('pending').textContent = data.pending || 0
   $('delivered').textContent = data.delivered || 0
   $('sourceCount').textContent = (data.sources || []).length
-  $('connection').textContent = '服务在线'
-  $('connection').classList.add('online')
+  const monitorHealthy = data.monitor_healthy !== false
+  $('connection').textContent = monitorHealthy ? '服务在线 · 监控正常' : '服务在线 · 监控心跳异常，正在自恢复'
+  $('connection').classList.toggle('online', monitorHealthy)
+  $('connection').title = data.monitor_heartbeat ? `监控心跳：${formatTime(data.monitor_heartbeat)}` : '尚未收到监控心跳'
   const running = Boolean(data.config?.enabled)
-  $('runtimeState').textContent = running ? '自动扫描与派送：运行中' : '自动扫描与派送：已暂停'
+  $('runtimeState').textContent = running ? (monitorHealthy ? '自动扫描与派送：运行中' : '监控异常，等待自动恢复') : '自动扫描与派送：已暂停'
   $('resumeService').disabled = running
   $('pauseService').disabled = !running
   $('lastError').textContent = data.last_error || ''

@@ -492,8 +492,10 @@ class Store:
             users = self.db.execute("SELECT COUNT(*) FROM users").fetchone()[0]
             pending = self.db.execute("SELECT COUNT(*) FROM deliveries WHERE status IN ('waiting','running','retry')").fetchone()[0]
             delivered = self.db.execute("SELECT COUNT(*) FROM deliveries WHERE status='delivered'").fetchone()[0]
+        heartbeat=int(self.get("monitor_heartbeat",0) or 0)
         return {"ok": True, "users": users, "pending": pending, "delivered": delivered,
                 "last_error": self.get("last_error", ""), "last_scan": self.get("last_scan", 0),
+                "monitor_heartbeat": heartbeat, "monitor_healthy": not self.get("enabled",False) or now()-heartbeat<180,
                 "baseline_ready": all(bool(x["baseline_ready"]) for x in self.sources()),
                 "public_url": self.get("public_url", ""), "config": self.config(False)}
 
@@ -988,6 +990,9 @@ class Application:
         self.qr_lock = threading.Lock()
         self.tmdb_cache = {}
         self.tmdb_lock = threading.Lock()
+        self.delivery_lock = threading.Lock()
+        self.cleanup_lock = threading.Lock()
+        self.loop_errors = {}
         self.p115_gate = RateGate()
         self.cd2_gate = RateGate()
         self.transfer_gate = RateGate()
@@ -1164,7 +1169,7 @@ class Application:
         if not user: raise ValueError("用户不存在")
         return {"provider": "115", "items": self.folders_115(user.get("cookie", ""), query.get("cid", ["0"])[0])}
 
-    def scan(self, force=True):
+    def scan(self, force=True, process_tasks=True):
         if not self.scan_lock.acquire(False): return
         try:
             cfg = self.store.config(True)
@@ -1181,8 +1186,9 @@ class Application:
                 self.store.set("baseline_ready",all(bool(x["baseline_ready"]) for x in sources))
                 self.store.set("baseline_count",sum(int(x["historical"]) for x in sources))
             self.store.set("last_error", "；".join(errors)[:2000])
-            self.deliver(cfg)
-            self.cleanup(cfg)
+            if process_tasks:
+                self.deliver(cfg)
+                self.cleanup(cfg)
         except Exception as exc: self.store.set("last_error", f"扫描：{exc}")
         finally: self.scan_lock.release()
 
@@ -1308,6 +1314,11 @@ class Application:
         return cat_ok if mode == "category" else term_ok if mode == "subscription" else cat_ok or term_ok
 
     def deliver(self, cfg):
+        if not self.delivery_lock.acquire(False): return
+        try: self._deliver(cfg)
+        finally: self.delivery_lock.release()
+
+    def _deliver(self, cfg):
         max_attempts=max(1,min(50,int(cfg.get("max_attempts") or 5))); stamp=now()
         with self.store.lock:
             rows = self.store.db.execute("""SELECT d.id,d.resource_id,d.tg_id,d.attempts,r.*,u.cookie,u.target_cid,u.name user_name,u.username,u.note
@@ -1361,6 +1372,11 @@ class Application:
             self.store.event("派送失败",f"{target_label}：{item['name']}；{error}{wait_text}",item["id"])
 
     def cleanup(self,cfg):
+        if not self.cleanup_lock.acquire(False): return
+        try: self._cleanup(cfg)
+        finally: self.cleanup_lock.release()
+
+    def _cleanup(self,cfg):
         stamp=now()
         with self.store.lock: rows=self.store.db.execute("""SELECT r.* FROM resources r JOIN sources s ON s.id=r.source_id
           WHERE r.cleanup='scheduled' AND r.delete_due>0 AND r.delete_due<=? AND (s.retention_minutes>=0 OR s.age_delete_minutes>=0)
@@ -1394,12 +1410,43 @@ class Application:
             except Exception:
                 with self.store.lock,self.store.db: self.store.db.execute("UPDATE users SET ck_status='unavailable',checked_at=? WHERE tg_id=?",(stamp,row["tg_id"]))
 
+    def loop_error(self,kind,exc):
+        message=redact_sensitive_text(exc)[:500]; stamp=now(); previous=self.loop_errors.get(kind)
+        self.store.set("last_error",f"{kind}：{message}")
+        if not previous or previous[0]!=message or stamp-previous[1]>=300:
+            self.loop_errors[kind]=(message,stamp)
+            self.store.event("后台自恢复",f"{kind}发生异常，循环将自动继续：{message}")
+
     def scheduler(self):
         while not self.stop.is_set():
-            cfg = self.store.config(False)
-            if cfg["enabled"]: self.scan(False)
-            self.maintenance(cfg)
+            try:
+                self.store.set("monitor_heartbeat",now())
+                cfg = self.store.config(False)
+                if cfg["enabled"]: self.scan(False,False)
+                self.store.set("monitor_heartbeat",now())
+            except Exception as exc: self.loop_error("监控循环",exc)
             self.stop.wait(2)
+
+    def work_scheduler(self):
+        while not self.stop.is_set():
+            try:
+                cfg=self.store.config(True)
+                if cfg["enabled"]:
+                    self.deliver(cfg)
+                    self.cleanup(cfg)
+                self.maintenance(cfg)
+            except Exception as exc: self.loop_error("任务循环",exc)
+            self.stop.wait(2)
+
+    def watchdog(self):
+        while not self.stop.wait(30):
+            try:
+                if not self.store.get("enabled",False): continue
+                heartbeat=int(self.store.get("monitor_heartbeat",0) or 0)
+                if heartbeat and now()-heartbeat>300:
+                    self.store.event("监控看门狗",f"监控心跳已停止 {now()-heartbeat} 秒，服务将自动重启恢复")
+                    os._exit(75)
+            except Exception as exc: self.loop_error("监控看门狗",exc)
 
 
 class Handler(BaseHTTPRequestHandler):
@@ -1495,7 +1542,10 @@ def main():
     parser=argparse.ArgumentParser(); parser.add_argument("--host",default="127.0.0.1"); parser.add_argument("--port",type=int,default=8790); parser.add_argument("--data",default="/var/lib/cockroach-runner"); parser.add_argument("--static",default=str(Path(__file__).with_name("static"))); args=parser.parse_args()
     admin_username=os.environ["COCKROACH_ADMIN_USERNAME"]; admin_password=os.environ["COCKROACH_ADMIN_PASSWORD"]; encryption_key=os.environ["COCKROACH_ENCRYPTION_KEY"]
     app=Application(Store(args.data,encryption_key)); server=ThreadingHTTPServer((args.host,args.port),Handler); server.app=app; server.admin_username=admin_username; server.admin_password=admin_password; server.static_dir=args.static
-    threading.Thread(target=app.telegram.loop,daemon=True).start(); threading.Thread(target=app.scheduler,daemon=True).start()
+    threading.Thread(target=app.telegram.loop,daemon=True,name="telegram").start()
+    threading.Thread(target=app.scheduler,daemon=True,name="monitor").start()
+    threading.Thread(target=app.work_scheduler,daemon=True,name="worker").start()
+    threading.Thread(target=app.watchdog,daemon=True,name="watchdog").start()
     try: server.serve_forever()
     finally: app.stop.set(); server.server_close()
 
