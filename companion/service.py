@@ -180,7 +180,7 @@ class Store:
             "cd2_api_interval_seconds": self.get("cd2_api_interval_seconds", 1),
             "transfer_interval_seconds": self.get("transfer_interval_seconds", 3),
             "transfer_timeout_seconds": self.get("transfer_timeout_seconds", 300),
-            "relay_stabilize_seconds": self.get("relay_stabilize_seconds", 12),
+            "relay_stabilize_seconds": self.get("relay_stabilize_seconds", 0),
             "distributed_transfer_enabled": self.get("distributed_transfer_enabled", False),
             "tmdb_enabled": self.get("tmdb_enabled", False),
             "tmdb_configured": bool(self.get("tmdb_api_key", "")),

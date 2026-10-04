@@ -95,7 +95,7 @@
           <label class="field"><span>CD2 API 最小间隔（秒）</span><input id="cd2ApiInterval" type="number" min="0" max="3600" step="0.1"></label>
           <label class="field"><span>秒传任务最小间隔（秒）</span><input id="transferInterval" type="number" min="0" max="3600" step="0.1"></label>
           <label class="field"><span>单个秒传总超时（秒）</span><input id="transferTimeout" type="number" min="30" max="3600" step="1"><small>默认 300 秒；超时后暂停该任务并按退避时间重试。</small></label>
-          <label class="field"><span>接力文件稳定等待（秒）</span><input id="relayStabilize" type="number" min="0" max="300" step="1"><small>默认 12 秒；给接收方整理程序留出移动时间，再按 SHA1 重新定位。</small></label>
+          <label class="field"><span>接力文件稳定等待（秒）</span><input id="relayStabilize" type="number" min="0" max="300" step="1"><small>默认 0 秒，优先抢在整理删除前接力；如果整理程序只移动不删除，可按需增加等待时间。</small></label>
         </div>
         <div class="checks"><label class="check"><input id="enabled" type="checkbox"> 启用自动扫描与派送</label><label class="check"><input id="cd2MetadataEnabled" type="checkbox"> 启用 CD2 元数据旁路（减少 115 API / 405）</label><label class="check"><input id="distributedTransfer" type="checkbox"> 启用成功账号接力秒传（实验）</label><label class="check"><input id="tmdbEnabled" type="checkbox"> 启用 TMDB 海报式成功推送</label><label class="check"><input id="miniEnabled" type="checkbox"> 启用 Telegram 小程序</label></div>
         <p class="setting-note">CD2 元数据旁路会从 CD2 API 读取文件 ID、SHA1 和大小，避免扫描时反复查询源 115 目录；CD2 不可用时自动回退 115 API。最终向用户账号派送仍使用 115 秒传。</p>
