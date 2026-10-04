@@ -354,7 +354,7 @@ function account() {
     <label class="field"><span>扫码登录端</span><select id="qrApp" ${state.qr && !["expired","error"].includes(state.qr.status) ? "disabled" : ""}>${Object.entries(state.qrApps).map(([value, label]) => `<option value="${esc(value)}" ${selectedQrApp === value ? "selected" : ""}>${esc(label)}</option>`).join("")}</select></label>
     <button class="primary full" data-qr-start ${state.saving ? "disabled" : ""}>${state.saving ? "正在生成..." : "扫码获取 CK"}</button>
     ${state.qr ? `<div class="qr-card">
-      <img src="${state.qr.image}" alt="115 登录二维码">
+      <img data-qr-image src="${esc(state.qr.image_url || state.qr.image)}" data-fallback="${esc(state.qr.image || "")}" alt="115 登录二维码" decoding="sync">
       <strong>${esc(qrLabels[state.qr.status] || state.qr.status)}</strong><span class="qr-app-name">${esc(state.qr.app_name || state.qrApps[state.qr.app] || state.qr.app)}</span>
       <small>${state.qr.error ? esc(state.qr.error) : "请使用 115 App 扫描，并在手机上确认登录。二维码约 5 分钟有效。"}</small>
       ${["expired","error"].includes(state.qr.status) ? '<button class="text-button" data-qr-start>重新生成</button>' : ''}
@@ -385,6 +385,18 @@ function bind() {
   root.querySelector("[data-save]")?.addEventListener("click", savePreferences);
   root.querySelector("[data-bind]")?.addEventListener("click", bindAccount);
   root.querySelectorAll("[data-qr-start]").forEach((node) => node.addEventListener("click", startQrLogin));
+  const qrImage = root.querySelector("[data-qr-image]");
+  qrImage?.addEventListener("error", () => {
+    const fallback = qrImage.dataset.fallback;
+    if (fallback && !qrImage.dataset.fallbackUsed) {
+      qrImage.dataset.fallbackUsed = "1";
+      qrImage.src = fallback;
+      return;
+    }
+    qrImage.hidden = true;
+    const hint = qrImage.closest(".qr-card")?.querySelector("small");
+    if (hint) hint.textContent = "二维码图片加载失败，请点击重新生成。";
+  });
   root.querySelector("[data-folder-open]")?.addEventListener("click", openMiniFolderPicker);
   root.querySelector("[data-folder-close]")?.addEventListener("click", () => { state.folder = null; render(); });
   root.querySelector("[data-folder-back]")?.addEventListener("click", () => { if (state.folder.stack.length > 1) state.folder.stack.pop(); loadMiniFolders(); });

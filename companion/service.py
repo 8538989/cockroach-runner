@@ -1115,8 +1115,13 @@ class Application:
         token,image=P115.qr_start(login_app); sid=secrets.token_urlsafe(24); expires=now()+300
         with self.qr_lock:
             self.qr_sessions={key:value for key,value in self.qr_sessions.items() if value["expires"]>now()}
-            self.qr_sessions[sid]={"tg_id":tg_id,"token":token,"app":login_app,"expires":expires}
-        return {"session":sid,"app":login_app,"app_name":QR_LOGIN_APPS[login_app],"expires":expires,"image":"data:image/png;base64,"+base64.b64encode(image).decode()}
+            self.qr_sessions[sid]={"tg_id":tg_id,"token":token,"app":login_app,"expires":expires,"image":image}
+        return {"session":sid,"app":login_app,"app_name":QR_LOGIN_APPS[login_app],"expires":expires,"image_url":"/api/mini/qr/image?session="+urllib.parse.quote(sid),"image":"data:image/png;base64,"+base64.b64encode(image).decode()}
+
+    def qr_image(self,sid):
+        with self.qr_lock: session=self.qr_sessions.get(str(sid or ""))
+        if not session or session["expires"]<=now(): raise ValueError("二维码已失效，请重新生成")
+        return session["image"]
 
     def qr_poll(self,tg_id,value):
         sid=str(value.get("session") or "")
@@ -1487,6 +1492,7 @@ class Handler(BaseHTTPRequestHandler):
             if path == "/style.css": return self.send_file("style.css", "text/css; charset=utf-8")
             if path == "/qr.css": return self.send_file("qr.css", "text/css; charset=utf-8")
             if path == "/brand-icon.mp4": return self.send_file("brand-icon.mp4", "video/mp4")
+            if path == "/api/mini/qr/image" and method == "GET": return self.send_bytes(200,self.app.qr_image(query.get("session",[""])[0]),"image/png")
             if path == "/api/admin/status" and method == "GET": self.admin(); return self.send_json(200, self.app.store.status())
             if path == "/api/admin/overview" and method == "GET": self.admin(); return self.send_json(200, self.app.store.overview())
             if path == "/api/admin/records" and method == "GET":
@@ -1536,6 +1542,8 @@ class Handler(BaseHTTPRequestHandler):
     def send_file(self, name, content_type):
         path = Path(self.server.static_dir) / name
         data = path.read_bytes(); self.send_response(200); self.send_header("Content-Type", content_type); self.send_header("Cache-Control", "no-cache"); self.send_header("Content-Length", str(len(data))); self.end_headers(); self.wfile.write(data)
+    def send_bytes(self, status, data, content_type):
+        self.send_response(status); self.send_header("Content-Type", content_type); self.send_header("Cache-Control", "no-store"); self.send_header("Content-Length", str(len(data))); self.end_headers(); self.wfile.write(data)
 
 
 def main():

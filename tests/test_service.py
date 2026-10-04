@@ -614,6 +614,8 @@ class ScanTests(unittest.TestCase):
                 service.P115.profile = staticmethod(lambda _cookie: {"uid": "1", "name": "QR User"})
                 started = app.qr_start(123, {"app": "115ios"})
                 self.assertEqual((started["app"], started["app_name"]), ("115ios", "115网盘（iOS端）"))
+                self.assertEqual(started["image_url"], f"/api/mini/qr/image?session={started['session']}")
+                self.assertEqual(app.qr_image(started["session"]), b"png")
                 result = app.qr_poll(123, {"session": started["session"], "target_cid": "9", "target_name": "扫码目录"})
                 self.assertEqual(result["status"], "confirmed")
                 user = store.user(123, True)
