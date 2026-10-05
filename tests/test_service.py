@@ -313,6 +313,30 @@ class ScanTests(unittest.TestCase):
             else: sys.modules["p115client"] = original_module
             service.P115.list_dir, service.P115._find_file_client, service.time.sleep = original_list, original_find, original_sleep
 
+    def test_cd2_mount_is_used_when_115_pickcode_is_stale(self):
+        with tempfile.TemporaryDirectory() as data_dir, tempfile.TemporaryDirectory() as cd2_dir:
+            store = service.Store(data_dir, Fernet.generate_key().decode())
+            store.set("source_cookie", "MAIN-CK", True)
+            filename = "Fallback.mkv"
+            local_file = Path(cd2_dir) / filename
+            local_file.write_bytes(b"x" * 100)
+            with store.db:
+                store.db.execute("UPDATE sources SET monitor_type='cd2_poll',cd2_path=? WHERE id='legacy'", (cd2_dir,))
+            app = service.Application(store)
+            item = {"id": "target", "resource_id": "r", "tg_id": 2, "source_id": "legacy", "target_cid": "99",
+                    "name": filename, "node_id": "10", "pickcode": "stale", "sha1": "ABC", "size": 100,
+                    "is_dir": 0, "user_name": "目标用户", "username": "", "note": ""}
+            calls = []
+            original_transfer = service.P115.transfer
+            try:
+                service.P115.transfer = staticmethod(lambda source, target, entry, cid, local_path="": calls.append((source, target, cid, local_path)))
+                cfg = store.config(True); cfg.update({"distributed_transfer_enabled": False, "transfer_timeout_seconds": 30})
+                self.assertEqual(app.transfer_delivery(cfg, item, "TARGET-CK"), "CD2本地兜底")
+                self.assertEqual(calls, [("", "TARGET-CK", "99", str(local_file))])
+            finally:
+                service.P115.transfer = original_transfer
+                store.db.close()
+
     def test_successful_recipient_wakes_retry_and_failed_peers_for_relay(self):
         with tempfile.TemporaryDirectory() as data_dir:
             store = service.Store(data_dir, Fernet.generate_key().decode())

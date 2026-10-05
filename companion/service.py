@@ -899,11 +899,11 @@ class P115:
         raise RuntimeError("创建115分类目录后未找到目录")
 
     @staticmethod
-    def transfer(source_cookie, user_cookie, entry, target_cid):
+    def transfer(source_cookie, user_cookie, entry, target_cid, local_path=""):
         from p115client import P115Client
         if entry["is_dir"]:
             raise RuntimeError("目录资源必须先展开为视频文件，不能作为一个整体派送")
-        source = P115Client(P115.cookie_mapping(source_cookie))
+        source = None if local_path else P115Client(P115.cookie_mapping(source_cookie))
         target = P115Client(P115.cookie_mapping(user_cookie))
 
         def target_entries():
@@ -1005,8 +1005,12 @@ class P115:
                 self.position += len(data)
                 return data
 
-        reader = RangeReader(source,entry["pickcode"], entry["name"], entry["size"])
-        result = target.upload_file(reader, pid=target_cid, filesha1=entry["sha1"], filesize=entry["size"], filename=entry["name"])
+        if local_path:
+            with open(local_path,"rb") as reader:
+                result = target.upload_file(reader, pid=target_cid, filesha1=entry["sha1"], filesize=entry["size"], filename=entry["name"])
+        else:
+            reader = RangeReader(source,entry["pickcode"], entry["name"], entry["size"])
+            result = target.upload_file(reader, pid=target_cid, filesha1=entry["sha1"], filesize=entry["size"], filename=entry["name"])
         if isinstance(result, dict) and result.get("state") is False:
             raise RuntimeError(result.get("error") or "115 传输失败")
         for _ in range(10):
@@ -1198,6 +1202,30 @@ class Application:
         if "error" in result: raise result["error"]
         return result.get("value")
 
+    def cd2_local_source(self,cfg,item):
+        """Find the monitored read-only CD2 file for rapid-upload proof reads."""
+        source=next((value for value in self.store.sources() if value["id"]==str(item.get("source_id") or "")),None)
+        if not source or source.get("monitor_type") not in {"cd2_realtime","cd2_poll"}: return ""
+        root=Path(str(source.get("cd2_path") or ""))
+        if not root.is_dir(): return ""
+        expected_name=str(item.get("name") or "")
+        expected_size=int(item.get("size") or 0)
+
+        def matches(path):
+            try: return path.is_file() and path.name==expected_name and (not expected_size or path.stat().st_size==expected_size)
+            except OSError: return False
+
+        direct=root/expected_name
+        if matches(direct): return str(direct)
+        visited=0
+        for current,dirs,files in os.walk(root):
+            visited+=1
+            if visited>1000: break
+            if expected_name in files:
+                candidate=Path(current)/expected_name
+                if matches(candidate): return str(candidate)
+        return ""
+
     def transfer_delivery(self,cfg,item,target_cookie):
         timeout=max(30,min(3600,int(cfg.get("transfer_timeout_seconds") or 300)))
         stabilize=max(0,min(300,int(cfg.get("relay_stabilize_seconds") or 0)))
@@ -1248,6 +1276,18 @@ class Application:
                     self.relay_failures[failure_key]=now()+1800
                     error=self.transfer_error(exc); relay_errors.append(f"{relay_label}：{error}")
                     self.store.event("接力跳过",f"{relay_label} → {target_label}：{item['name']}；{error}",item["id"])
+        local_path=self.cd2_local_source(cfg,item)
+        if local_path:
+            try:
+                self.timed_call(lambda:P115.transfer("",target_cookie,item,item["target_cid"],local_path),remaining_timeout())
+                self.store.event("CD2兜底",f"{target_label}：从监听挂载读取秒传验证片段成功；{item['name']}",item["id"])
+                return "CD2本地兜底"
+            except TimeoutError:
+                raise
+            except Exception as exc:
+                error=self.transfer_error(exc)
+                relay_errors.append(f"CD2本地兜底：{error}")
+                self.store.event("CD2兜底失败",f"{target_label}：{item['name']}；{error}",item["id"])
         source_cookie=self.store.source_cookie(item["source_id"],cfg["source_cookie"])
         if not source_cookie: raise RuntimeError("资源所属监听目录没有可用的 115 CK")
         if relay_errors:
